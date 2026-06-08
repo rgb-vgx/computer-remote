@@ -38,7 +38,10 @@ log = logging.getLogger("host")
 class H264Encoder:
     """Encode raw BGR frames to H.264 via ffmpeg subprocess."""
 
-    def __init__(self, width: int, height: int, fps: int, crf: int = 23) -> None:
+    def __init__(self, width: int, height: int, fps: int,
+                 quality: int = 85) -> None:
+        # quality 1-100 → CRF 45–10 (lower CRF = better quality)
+        crf = int(max(10, 51 - quality * 0.41))
         self.width = width
         self.height = height
 
@@ -299,7 +302,7 @@ class HostServer:
             log.info("Sử dụng codec JPEG")
 
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 monitor = sct.monitors[1]
 
                 # First capture to get dimensions
@@ -313,7 +316,8 @@ class HostServer:
                     frame_w, frame_h = cap_w, cap_h
 
                 if use_h264:
-                    h264_enc = H264Encoder(frame_w, frame_h, self.args.fps)
+                    h264_enc = H264Encoder(frame_w, frame_h, self.args.fps,
+                                           self.args.quality)
                     protocol.send_json(
                         sock, protocol.PKT_INFO,
                         {"type": "codec", "codec": "h264",
@@ -527,7 +531,7 @@ class HostServer:
 
     def _screen_size(self) -> tuple[int, int]:
         if not hasattr(self, "_screen_cache"):
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 mon = sct.monitors[1]
                 self._screen_cache = (mon["width"], mon["height"])
         return self._screen_cache
@@ -564,8 +568,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--port", type=int, default=7777)
     p.add_argument("--token", default="1")
     p.add_argument("--fps", type=int, default=8)
-    p.add_argument("--quality", type=int, default=60)
-    p.add_argument("--max-width", type=int, default=1280)
+    p.add_argument("--quality", type=int, default=85,
+                   help="Chất lượng nén (JPEG: 1-100, H.264: 1-100 → CRF 51-10)")
+    p.add_argument("--max-width", type=int, default=1920)
     p.add_argument("--codec", choices=["jpeg", "h264"], default="h264",
                    help="Codec: jpeg hoặc h264 (mặc định h264, fallback jpeg nếu thiếu ffmpeg)")
     p.add_argument("--view-only", action="store_true")
