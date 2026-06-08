@@ -216,6 +216,7 @@ class NetworkWorker(QThread):
         try:
             self.status.emit(f"Đang kết nối tới {self.host}:{self.port} ...")
             sock = socket.create_connection((self.host, self.port), timeout=10)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.setblocking(True)
 
             protocol.send_json(sock, protocol.PKT_HELLO, {
@@ -267,6 +268,7 @@ class NetworkWorker(QThread):
             elif ptype == protocol.PKT_CONTROL:
                 self._handle_control(payload)
             elif ptype == protocol.PKT_INFO:
+                self._flush_control()  # flush before potentially slow h264 init
                 try:
                     info = protocol.decode_json(payload)
                 except Exception:
