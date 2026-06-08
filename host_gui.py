@@ -381,14 +381,17 @@ class TrayManager:
             self.window.raise_()
             self.window.activateWindow()
 
+    def _show_menu(self) -> None:
+        if self.icon and self.icon.contextMenu():
+            self.icon.contextMenu().popup(QCursor.pos())
+
     def _on_activated(self, reason) -> None:
-        if reason == QSystemTrayIcon.ActivationReason.Context:
-            if self.icon and self.icon.contextMenu():
-                self.icon.contextMenu().popup(QCursor.pos())
-        elif reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+        # KDE Plasma often doesn't show setContextMenu on right-click,
+        # so we show it manually on every activation except double-click.
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self._toggle_window()
-        elif reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self._toggle_window()
+        else:
+            self._show_menu()
 
     def _quit(self) -> None:
         if self.window.server_thread is not None:
