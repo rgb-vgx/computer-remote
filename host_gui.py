@@ -15,8 +15,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import random
-import string
 import subprocess
 import sys
 from pathlib import Path
@@ -368,8 +366,8 @@ def parse_gui_args(argv=None) -> argparse.Namespace:
     p.add_argument("--bind", default="0.0.0.0",
                    help="Địa chỉ bind (mặc định 0.0.0.0).")
     p.add_argument("--port", type=int, default=7777, help="Cổng TCP (mặc định 7777).")
-    p.add_argument("--token", default="",
-                   help="Token (mặc định: tự sinh).")
+    p.add_argument("--token", default="1",
+                   help="Token để client xác thực.")
     p.add_argument("--fps", type=int, default=8, help="Số frame/giây mục tiêu.")
     p.add_argument("--quality", type=int, default=60, help="Chất lượng JPEG (1-100).")
     p.add_argument("--max-width", type=int, default=1280,
@@ -385,9 +383,7 @@ def main() -> int:
     args = parse_gui_args()
     _setup_logging(args.debug)
 
-    if not args.token:
-        args.token = "".join(random.choices(string.ascii_letters + string.digits, k=12))
-        log.info("Token tự sinh: %s", args.token)
+    log.info("Token: %s", args.token)
 
     if not detect_display():
         log.warning("KHÔNG tìm thấy display X11 nào!")
