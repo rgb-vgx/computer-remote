@@ -412,6 +412,8 @@ def parse_gui_args(argv=None) -> argparse.Namespace:
                    help="Codec: jpeg hoặc h264 (mặc định jpeg)")
     p.add_argument("--view-only", action="store_true",
                    help="Chỉ stream, không nhận control.")
+    p.add_argument("--auto-start", action="store_true",
+                   help="Tự động bắt đầu stream ngay khi khởi động.")
     p.add_argument("--debug", action="store_true",
                    help="Bật log debug chi tiết.")
     return p.parse_args(argv)
@@ -437,6 +439,8 @@ def main() -> int:
     TrayManager(app, window).setup()
 
     window.show()
+    if args.auto_start:
+        window._start_server()
     return app.exec()
 
 
