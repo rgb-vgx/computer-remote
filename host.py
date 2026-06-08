@@ -263,6 +263,10 @@ class HostServer:
         protocol.send_json(sock, protocol.PKT_INFO,
                            {"type": "info", "message": "auth ok"})
 
+        # Codec negotiation: client's supported codecs
+        client_codecs = hello.get("codecs", ["jpeg"])
+        self._client_supports_h264 = "h264" in client_codecs
+
         sock.settimeout(None)
         client_stop = threading.Event()
 
@@ -291,9 +295,12 @@ class HostServer:
         frames_since_log = 0
         last_log = time.time()
 
-        # Decide codec
-        use_h264 = (self.args.codec == 'h264' and H264Encoder.available()
-                    and H264Encoder.libx264_available())
+        # Decide codec: host supports h264 AND client supports it
+        host_h264 = (self.args.codec == 'h264' and H264Encoder.available()
+                     and H264Encoder.libx264_available())
+        use_h264 = host_h264 and getattr(self, '_client_supports_h264', False)
+        if self.args.codec == 'h264' and not use_h264:
+            log.info("Client không hỗ trợ H.264, fallback JPEG")
         h264_enc: H264Encoder | None = None
 
         if use_h264:

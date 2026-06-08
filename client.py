@@ -218,7 +218,10 @@ class NetworkWorker(QThread):
             sock = socket.create_connection((self.host, self.port), timeout=10)
             sock.setblocking(True)
 
-            protocol.send_json(sock, protocol.PKT_HELLO, {"token": self.token})
+            protocol.send_json(sock, protocol.PKT_HELLO, {
+                "token": self.token,
+                "codecs": ["jpeg", "h264"] if H264Decoder.available() else ["jpeg"],
+            })
             log.debug("Đã gửi HELLO tới %s:%d", self.host, self.port)
 
             self.status.emit("Đã gửi token, chờ host xác thực ...")
@@ -285,9 +288,17 @@ class NetworkWorker(QThread):
                                     self._h264_dec = H264Decoder(w, h)
                                     log.info("H.264 decoder ready (%dx%d)", w, h)
                                 except Exception:
-                                    log.warning("Không khởi tạo được H.264 decoder, fallback JPEG")
+                                    log.warning("H.264 decoder init fail, yêu cầu host dùng JPEG")
+                                    self.send_control({
+                                        "event": "codec_request",
+                                        "codec": "jpeg",
+                                    })
                             else:
-                                log.warning("ffmpeg not found, fallback JPEG")
+                                log.warning("ffmpeg not found, yêu cầu host dùng JPEG")
+                                self.send_control({
+                                    "event": "codec_request",
+                                    "codec": "jpeg",
+                                })
                     continue
                 log.info("Kết nối thành công — %s", msg)
                 self.status.emit(f"Đã kết nối — {msg}")
