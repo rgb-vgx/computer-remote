@@ -406,7 +406,7 @@ def parse_gui_args(argv=None) -> argparse.Namespace:
                    help="Token để client xác thực.")
     p.add_argument("--fps", type=int, default=8, help="Số frame/giây mục tiêu.")
     p.add_argument("--quality", type=int, default=75, help="Chất lượng nén (1-100).")
-    p.add_argument("--max-width", type=int, default=1280,
+    p.add_argument("--max-width", type=int, default=1920,
                    help="Resize xuống nếu rộng hơn (giữ aspect ratio).")
     p.add_argument("--codec", choices=["jpeg", "h264"], default="jpeg",
                    help="Codec: jpeg hoặc h264 (mặc định jpeg)")

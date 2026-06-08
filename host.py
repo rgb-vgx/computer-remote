@@ -587,7 +587,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--fps", type=int, default=8)
     p.add_argument("--quality", type=int, default=75,
                    help="Chất lượng nén (JPEG: 1-100, H.264: 1-100 → CRF 51-10)")
-    p.add_argument("--max-width", type=int, default=1280)
+    p.add_argument("--max-width", type=int, default=1920)
     p.add_argument("--codec", choices=["jpeg", "h264"], default="jpeg",
                    help="Codec: jpeg hoặc h264 (mặc định jpeg; h264 cần ffmpeg, có thể bị delay)")
     p.add_argument("--view-only", action="store_true")
