@@ -330,8 +330,14 @@ class HostServer:
                         {"type": "codec", "codec": "h264",
                          "width": frame_w, "height": frame_h})
 
+                skip_until = 0.0
                 while not client_stop.is_set() and not self.stop_event.is_set():
-                    t0 = time.time()
+                    now = time.time()
+                    if now < skip_until:
+                        time.sleep(min(0.01, skip_until - now))
+                        continue
+
+                    t0 = now
                     raw = sct.grab(monitor)
                     img = np.asarray(raw)[:, :, :3]
                     if img.shape[1] > self.args.max_width:
@@ -350,28 +356,32 @@ class HostServer:
                         ok, buf = cv2.imencode(".jpg", img, encode_params)
                         if not ok:
                             log.error("cv2.imencode thất bại")
+                            skip_until = now + frame_budget
                             continue
                         protocol.send_packet(
                             sock, protocol.PKT_FRAME, buf.tobytes())
 
                     frames_since_log += 1
-                    now = time.time()
-                    if now - last_log >= 5.0:
+                    now2 = time.time()
+                    if now2 - last_log >= 5.0:
                         if use_h264:
                             log.info("Stream ~%.1f FPS (H.264 %dx%d)",
-                                     frames_since_log / (now - last_log),
+                                     frames_since_log / (now2 - last_log),
                                      frame_w, frame_h)
                         else:
                             log.info("Stream ~%.1f FPS (JPEG %dx%d, q=%d)",
-                                     frames_since_log / (now - last_log),
+                                     frames_since_log / (now2 - last_log),
                                      img.shape[1], img.shape[0],
                                      self.args.quality)
                         frames_since_log = 0
-                        last_log = now
+                        last_log = now2
 
-                    elapsed = time.time() - t0
+                    elapsed = now2 - t0
                     if elapsed < frame_budget:
                         time.sleep(frame_budget - elapsed)
+                    else:
+                        # encode chậm hơn frame_budget → skip 1 frame
+                        skip_until = now2 + frame_budget
         except (ConnectionError, OSError, struct.error) as exc:
             log.info("Capture loop dừng: %s", exc)
         except Exception as exc:
@@ -575,9 +585,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--port", type=int, default=7777)
     p.add_argument("--token", default="1")
     p.add_argument("--fps", type=int, default=8)
-    p.add_argument("--quality", type=int, default=85,
+    p.add_argument("--quality", type=int, default=75,
                    help="Chất lượng nén (JPEG: 1-100, H.264: 1-100 → CRF 51-10)")
-    p.add_argument("--max-width", type=int, default=1920)
+    p.add_argument("--max-width", type=int, default=1280)
     p.add_argument("--codec", choices=["jpeg", "h264"], default="jpeg",
                    help="Codec: jpeg hoặc h264 (mặc định jpeg; h264 cần ffmpeg, có thể bị delay)")
     p.add_argument("--view-only", action="store_true")
