@@ -115,9 +115,9 @@ class H264Decoder:
     @staticmethod
     def available() -> bool:
         try:
-            sp.run(['ffmpeg', '-version'], capture_output=True, timeout=2,
-                   shell=True)
-            return True
+            r = sp.run(['ffmpeg', '-version'],
+                       capture_output=True, timeout=2, shell=False)
+            return r.returncode == 0
         except Exception:
             return False
 
@@ -281,10 +281,13 @@ class NetworkWorker(QThread):
                             self._frame_w = w
                             self._frame_h = h
                             if H264Decoder.available():
-                                self._h264_dec = H264Decoder(w, h)
-                                log.info("H.264 decoder ready (%dx%d)", w, h)
+                                try:
+                                    self._h264_dec = H264Decoder(w, h)
+                                    log.info("H.264 decoder ready (%dx%d)", w, h)
+                                except Exception:
+                                    log.warning("Không khởi tạo được H.264 decoder, fallback JPEG")
                             else:
-                                log.warning("ffmpeg not found, H.264 not available")
+                                log.warning("ffmpeg not found, fallback JPEG")
                     continue
                 log.info("Kết nối thành công — %s", msg)
                 self.status.emit(f"Đã kết nối — {msg}")
