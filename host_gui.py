@@ -408,8 +408,8 @@ def parse_gui_args(argv=None) -> argparse.Namespace:
     p.add_argument("--quality", type=int, default=85, help="Chất lượng nén (1-100).")
     p.add_argument("--max-width", type=int, default=1920,
                    help="Resize xuống nếu rộng hơn (giữ aspect ratio).")
-    p.add_argument("--codec", choices=["jpeg", "h264"], default="h264",
-                   help="Codec: jpeg hoặc h264 (mặc định h264)")
+    p.add_argument("--codec", choices=["jpeg", "h264"], default="jpeg",
+                   help="Codec: jpeg hoặc h264 (mặc định jpeg)")
     p.add_argument("--view-only", action="store_true",
                    help="Chỉ stream, không nhận control.")
     p.add_argument("--debug", action="store_true",
