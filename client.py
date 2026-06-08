@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
-"""client.py — Remote desktop CLIENT/VIEWER (chạy trên Windows).
+"""client.py — Remote desktop CLIENT/VIEWER.
 
-Chức năng:
-  * GUI PySide6: nhập Host IP / Port / Token, Connect / Disconnect.
-  * Nhận frame JPEG từ host, hiển thị.
-  * Mouse + Keyboard control.
-  * Clipboard 2 chiều.
+Supports JPEG and H.264 decoding. H.264 requires ffmpeg.
 
 Usage:
   python client.py [--debug]
@@ -19,7 +15,10 @@ import os
 import queue
 import select
 import socket
+import subprocess as sp
 import sys
+import threading
+import time
 
 import cv2
 import numpy as np
@@ -36,33 +35,106 @@ log = logging.getLogger("client")
 
 
 # ---------------------------------------------------------------------------
-# Key mapping (Qt → pynput)
+# H.264 decoder (ffmpeg subprocess)
+# ---------------------------------------------------------------------------
+
+class H264Decoder:
+    """Decode H.264 Annex B stream to raw BGR frames via ffmpeg."""
+
+    def __init__(self, width: int, height: int) -> None:
+        self.width = width
+        self.height = height
+        self.frame_size = width * height * 3
+        self._buf = b''
+        self._lock = threading.Lock()
+        self._closed = False
+
+        self._proc = sp.Popen(
+            ['ffmpeg',
+             '-f', 'h264',
+             '-i', '-',
+             '-f', 'rawvideo',
+             '-pix_fmt', 'bgr24',
+             '-flags', 'low_delay',
+             '-'],
+            stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.DEVNULL,
+            bufsize=1024**2)
+
+        self._reader = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader.start()
+
+    def _reader_loop(self) -> None:
+        fd = self._proc.stdout.fileno()
+        nonblocking = False
+        try:
+            os.set_blocking(fd, False)
+            nonblocking = True
+        except (OSError, AttributeError):
+            pass
+
+        while not self._closed and self._proc.poll() is None:
+            try:
+                if nonblocking:
+                    chunk = os.read(fd, 65536)
+                else:
+                    chunk = self._proc.stdout.read1(65536)
+                if not chunk:
+                    break
+                with self._lock:
+                    self._buf += chunk
+            except BlockingIOError:
+                time.sleep(0.01)
+            except Exception:
+                break
+
+    def feed(self, data: bytes) -> None:
+        try:
+            self._proc.stdin.write(data)
+            self._proc.stdin.flush()
+        except Exception:
+            pass
+
+    def read_frame(self) -> np.ndarray | None:
+        with self._lock:
+            if len(self._buf) >= self.frame_size:
+                raw = self._buf[:self.frame_size]
+                self._buf = self._buf[self.frame_size:]
+                return np.frombuffer(raw, dtype=np.uint8).reshape(
+                    self.height, self.width, 3)
+        return None
+
+    def close(self) -> None:
+        self._closed = True
+        try:
+            self._proc.stdin.close()
+            self._proc.terminate()
+            self._proc.wait(timeout=2)
+        except Exception:
+            self._proc.kill()
+
+    @staticmethod
+    def available() -> bool:
+        try:
+            sp.run(['ffmpeg', '-version'], capture_output=True, timeout=2,
+                   shell=True)
+            return True
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Key mapping
 # ---------------------------------------------------------------------------
 
 _QT_KEY_TO_NAME = {
-    0x01000020: "shift",
-    0x01000021: "ctrl",
-    0x01000023: "alt",
-    0x01000024: "meta",
-    0x01001103: "alt_gr",
-    0x01000022: "caps_lock",
-    0x01000004: "enter",
-    0x01000005: "return",
-    0x01000001: "tab",
-    0x01000003: "backspace",
-    0x01000000: "esc",
-    0x01000006: "delete",
-    0x01000010: "home",
-    0x01000011: "end",
-    0x01000016: "page_up",
-    0x01000017: "page_down",
-    0x01000007: "insert",
-    0x01000008: "menu",
-    0x01000009: "pause",
-    0x0100000a: "print_screen",
-    0x01000012: "left",
-    0x01000013: "up",
-    0x01000014: "right",
+    0x01000020: "shift", 0x01000021: "ctrl", 0x01000023: "alt",
+    0x01000024: "meta", 0x01001103: "alt_gr", 0x01000022: "caps_lock",
+    0x01000004: "enter", 0x01000005: "return", 0x01000001: "tab",
+    0x01000003: "backspace", 0x01000000: "esc", 0x01000006: "delete",
+    0x01000010: "home", 0x01000011: "end", 0x01000016: "page_up",
+    0x01000017: "page_down", 0x01000007: "insert", 0x01000008: "menu",
+    0x01000009: "pause", 0x0100000a: "print_screen",
+    0x01000012: "left", 0x01000013: "up", 0x01000014: "right",
     0x01000015: "down",
     0x01000030: "f1",  0x01000031: "f2",  0x01000032: "f3",
     0x01000033: "f4",  0x01000034: "f5",  0x01000035: "f6",
@@ -77,7 +149,7 @@ def _qt_key_to_key_str(qt_key: int, text: str) -> str | None:
         return f"Key.{name}"
     if text and text.isprintable():
         return text
-    if qt_key == 0x20:  # space
+    if qt_key == 0x20:
         return " "
     return None
 
@@ -90,14 +162,12 @@ def _setup_logging(debug: bool) -> None:
     level = logging.DEBUG if debug else logging.INFO
     fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     logging.basicConfig(level=level, format=fmt, datefmt="%H:%M:%S")
-
     logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
     os.makedirs(logs_dir, exist_ok=True)
     fh = logging.FileHandler(os.path.join(logs_dir, "client.log"), encoding="utf-8")
     fh.setLevel(level)
     fh.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
     logging.getLogger().addHandler(fh)
-
     log.info("Client log file: %s", os.path.join(logs_dir, "client.log"))
     if debug:
         log.info("DEBUG mode ON")
@@ -118,9 +188,12 @@ class NetworkWorker(QThread):
         self.host = host
         self.port = port
         self.token = token
-        self.control_queue: "queue.Queue[dict]" = queue.Queue()
+        self.control_queue: queue.Queue[dict] = queue.Queue()
         self._running = True
         self._sock: socket.socket | None = None
+        self._h264_dec: H264Decoder | None = None
+        self._frame_w = 0
+        self._frame_h = 0
 
     def stop(self) -> None:
         self._running = False
@@ -156,6 +229,8 @@ class NetworkWorker(QThread):
         except Exception as exc:
             self.disconnected.emit(f"Lỗi: {exc}")
         finally:
+            if self._h264_dec:
+                self._h264_dec.close()
             if sock is not None:
                 try:
                     sock.close()
@@ -183,8 +258,9 @@ class NetworkWorker(QThread):
                 return
 
             if ptype == protocol.PKT_FRAME:
-                log.debug("Nhận frame: %d bytes", len(payload))
-                self._handle_frame(payload)
+                self._handle_jpeg(payload)
+            elif ptype == protocol.PKT_FRAME_H264:
+                self._handle_h264(payload)
             elif ptype == protocol.PKT_CONTROL:
                 self._handle_control(payload)
             elif ptype == protocol.PKT_INFO:
@@ -196,6 +272,20 @@ class NetworkWorker(QThread):
                 if info.get("type") == "error":
                     self.disconnected.emit(f"Host từ chối: {msg}")
                     return
+                elif info.get("type") == "codec":
+                    c = info.get("codec", "")
+                    if c == "h264":
+                        w = info.get("width", 0)
+                        h = info.get("height", 0)
+                        if w and h:
+                            self._frame_w = w
+                            self._frame_h = h
+                            if H264Decoder.available():
+                                self._h264_dec = H264Decoder(w, h)
+                                log.info("H.264 decoder ready (%dx%d)", w, h)
+                            else:
+                                log.warning("ffmpeg not found, H.264 not available")
+                    continue
                 log.info("Kết nối thành công — %s", msg)
                 self.status.emit(f"Đã kết nối — {msg}")
 
@@ -212,7 +302,7 @@ class NetworkWorker(QThread):
             except OSError:
                 return
 
-    def _handle_frame(self, payload: bytes) -> None:
+    def _handle_jpeg(self, payload: bytes) -> None:
         arr = np.frombuffer(payload, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
@@ -222,20 +312,31 @@ class NetworkWorker(QThread):
         qimg = QImage(img.data, w, h, 3 * w, QImage.Format_RGB888).copy()
         self.frame_ready.emit(qimg)
 
+    def _handle_h264(self, payload: bytes) -> None:
+        if self._h264_dec is None:
+            return
+        self._h264_dec.feed(payload)
+        img = self._h264_dec.read_frame()
+        if img is not None:
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            h, w = self._frame_h, self._frame_w
+            qimg = QImage(img_rgb.data, w, h, 3 * w,
+                          QImage.Format_RGB888).copy()
+            self.frame_ready.emit(qimg)
+
     def _handle_control(self, payload: bytes) -> None:
         try:
             event = protocol.decode_json(payload)
         except Exception:
             return
-        kind = event.get("event")
-        if kind == "clipboard":
+        if event.get("event") == "clipboard":
             text = event.get("text", "")
             if text:
                 self.clipboard_from_host.emit(text)
 
 
 # ---------------------------------------------------------------------------
-# Remote view (mouse + keyboard)
+# Remote view
 # ---------------------------------------------------------------------------
 
 class RemoteView(QLabel):
@@ -249,7 +350,6 @@ class RemoteView(QLabel):
         self.setStyleSheet("background-color: #101010; color: #aaa;")
         self.setText("Chưa kết nối")
         self.setMouseTracking(True)
-        # Cho phép nhận key event.
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self._pixmap: QPixmap | None = None
@@ -324,8 +424,6 @@ class RemoteView(QLabel):
                 {"event": "mouse_up", "button": btn,
                  "x": coord[0], "y": coord[1]})
 
-    # ---- Keyboard --------------------------------------------------------
-
     def keyPressEvent(self, event) -> None:
         key_str = _qt_key_to_key_str(event.key(), event.text())
         if key_str:
@@ -349,11 +447,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Remote Desktop Client (MVP)")
         self.worker: NetworkWorker | None = None
 
-        # Clipboard state
         self._last_clipboard = ""
         self._clipboard_skip = 0
 
-        # ---- form ----
         self.host_edit = QLineEdit("100.")
         self.host_edit.setPlaceholderText("Tailscale IP, vd 100.x.y.z")
         self.port_edit = QLineEdit("7777")
@@ -373,7 +469,6 @@ class MainWindow(QMainWindow):
         form.addWidget(self.token_edit)
         form.addWidget(self.connect_btn)
 
-        # ---- view + status ----
         self.view = RemoteView()
         self.view.mouse_event.connect(self._on_mouse_event)
         self.view.key_event.connect(self._on_key_event)
@@ -390,7 +485,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.resize(1100, 720)
 
-        # ---- clipboard timer ----
         self._clipboard_timer = QTimer(self)
         self._clipboard_timer.timeout.connect(self._check_clipboard)
 
@@ -425,7 +519,6 @@ class MainWindow(QMainWindow):
         self._set_form_enabled(False)
         self.status_label.setText("Trạng thái: Connecting...")
 
-        # Start clipboard polling
         self._last_clipboard = ""
         self._clipboard_skip = 0
         self._clipboard_timer.start(500)
@@ -456,15 +549,12 @@ class MainWindow(QMainWindow):
     def _on_key_event(self, event: dict) -> None:
         if self.worker is not None:
             self.worker.send_control(event)
-            log.debug("Key: %s %s", event.get("event"), event.get("key"))
 
     def closeEvent(self, event) -> None:
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(2000)
         super().closeEvent(event)
-
-    # ---- Clipboard -------------------------------------------------------
 
     def _check_clipboard(self) -> None:
         if self._clipboard_skip > 0:
@@ -482,9 +572,8 @@ class MainWindow(QMainWindow):
 
     def _on_clipboard_from_host(self, text: str) -> None:
         self._last_clipboard = text
-        self._clipboard_skip = 2  # skip next 2 polls (~1s)
+        self._clipboard_skip = 2
         QApplication.clipboard().setText(text)
-        log.debug("Clipboard từ host → set client (%d bytes)", len(text))
 
 
 # ---------------------------------------------------------------------------
@@ -493,7 +582,7 @@ class MainWindow(QMainWindow):
 
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Remote desktop CLIENT (PySide6).")
-    p.add_argument("--debug", action="store_true", help="Bật log debug chi tiết.")
+    p.add_argument("--debug", action="store_true")
     return p.parse_args(argv)
 
 
@@ -501,7 +590,6 @@ def main() -> int:
     args = parse_args()
     _setup_logging(args.debug)
     log.info("=== Remote Desktop Client ===")
-
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()

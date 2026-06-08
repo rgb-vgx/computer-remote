@@ -30,10 +30,11 @@ HEADER = struct.Struct(">IB")
 HEADER_SIZE = HEADER.size  # = 5
 
 # Packet types.
-PKT_FRAME = 1
-PKT_CONTROL = 2
-PKT_HELLO = 3
-PKT_INFO = 4
+PKT_FRAME = 1   # JPEG frame
+PKT_CONTROL = 2  # control event (mouse/keyboard/clipboard JSON)
+PKT_HELLO = 3    # auth hello (JSON)
+PKT_INFO = 4     # info/error (JSON)
+PKT_FRAME_H264 = 5  # H.264 frame
 
 # Guard: từ chối payload_len bất thường (lỗi đồng bộ hoặc dữ liệu độc) để
 # không cấp phát bộ nhớ khổng lồ. 64 MiB dư sức cho 1 frame JPEG.

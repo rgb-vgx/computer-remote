@@ -17,7 +17,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap, QColor, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFormLayout, QGroupBox, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
     QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
@@ -185,6 +185,12 @@ class MainWindow(QMainWindow):
         info_layout.addRow("IP:", self.ip_label)
         self.port_label = QLabel(str(args.port))
         info_layout.addRow("Port:", self.port_label)
+
+        self.codec_combo = QComboBox()
+        self.codec_combo.addItems(["H.264 (cần ffmpeg)", "JPEG"])
+        self.codec_combo.setCurrentIndex(0 if args.codec == "h264" else 1)
+        info_layout.addRow("Codec:", self.codec_combo)
+
         layout.addWidget(info_group)
 
         # Status
@@ -241,6 +247,7 @@ class MainWindow(QMainWindow):
         if not self.args.token:
             QMessageBox.warning(self, "Lỗi", "Token không được để trống.")
             return
+        self.args.codec = "h264" if self.codec_combo.currentIndex() == 0 else "jpeg"
 
         self.server_thread = ServerThread(self.args)
         self.server_thread.status_changed.connect(self._on_status_changed)
@@ -385,6 +392,8 @@ def parse_gui_args(argv=None) -> argparse.Namespace:
     p.add_argument("--quality", type=int, default=60, help="Chất lượng JPEG (1-100).")
     p.add_argument("--max-width", type=int, default=1280,
                    help="Resize xuống nếu rộng hơn (giữ aspect ratio).")
+    p.add_argument("--codec", choices=["jpeg", "h264"], default="h264",
+                   help="Codec: jpeg hoặc h264 (mặc định h264)")
     p.add_argument("--view-only", action="store_true",
                    help="Chỉ stream, không nhận control.")
     p.add_argument("--debug", action="store_true",
