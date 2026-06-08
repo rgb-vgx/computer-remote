@@ -414,6 +414,8 @@ def parse_gui_args(argv=None) -> argparse.Namespace:
                    help="Chỉ stream, không nhận control.")
     p.add_argument("--auto-start", action="store_true",
                    help="Tự động bắt đầu stream ngay khi khởi động.")
+    p.add_argument("--tray", action="store_true",
+                   help="Chạy ẩn dưới tray (không hiện cửa sổ).")
     p.add_argument("--debug", action="store_true",
                    help="Bật log debug chi tiết.")
     return p.parse_args(argv)
@@ -438,7 +440,10 @@ def main() -> int:
     window = MainWindow(args)
     TrayManager(app, window).setup()
 
-    window.show()
+    if args.tray:
+        window.hide()
+    else:
+        window.show()
     if args.auto_start:
         window._start_server()
     return app.exec()
