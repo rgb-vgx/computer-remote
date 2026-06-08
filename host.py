@@ -310,16 +310,31 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Resize xuống nếu rộng hơn (giữ aspect ratio).")
     p.add_argument("--view-only", action="store_true",
                    help="Nếu bật: chỉ stream, KHÔNG nhận/inject control.")
+    p.add_argument("--debug", action="store_true",
+                   help="Bật log debug chi tiết.")
     return p.parse_args(argv)
 
 
 def main() -> int:
+    args = parse_args()
+    level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    args = parse_args()
+
+    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    fh = logging.FileHandler(os.path.join(logs_dir, "host.log"), encoding="utf-8")
+    fh.setLevel(level)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"))
+    logging.getLogger().addHandler(fh)
+
+    log.info("Host log file: %s", os.path.join(logs_dir, "host.log"))
+    if args.debug:
+        log.info("DEBUG mode ON")
 
     log.info("=== Remote desktop HOST (MVP, foreground) ===")
     check_display_env()

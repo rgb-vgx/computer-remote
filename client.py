@@ -8,12 +8,18 @@ Chức năng:
     normalized (0..1) và gửi về host — resize cửa sổ vẫn điều khiển đúng.
 
 Mọi việc socket nằm trong 1 worker thread (QThread); GUI thread chỉ chạm UI.
-Chạy: python client.py
+
+Usage:
+  python client.py [--debug]
 """
 
 from __future__ import annotations
 
+import argparse
+import logging
+import os
 import queue
+import select
 import socket
 import sys
 
@@ -28,12 +34,40 @@ from PySide6.QtWidgets import (
 
 from common import protocol
 
+log = logging.getLogger("client")
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def _setup_logging(debug: bool) -> None:
+    level = logging.DEBUG if debug else logging.INFO
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+    logging.basicConfig(level=level, format=fmt, datefmt="%H:%M:%S")
+
+    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    fh = logging.FileHandler(os.path.join(logs_dir, "client.log"), encoding="utf-8")
+    fh.setLevel(level)
+    fh.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
+    logging.getLogger().addHandler(fh)
+
+    log.info("Client log file: %s", os.path.join(logs_dir, "client.log"))
+    if debug:
+        log.info("DEBUG mode ON")
+
+
+# ---------------------------------------------------------------------------
+# Network worker
+# ---------------------------------------------------------------------------
 
 class NetworkWorker(QThread):
     """Thread giữ socket: connect → hello → loop nhận frame; flush control queue.
 
-    Chỉ thread này chạm tới socket. GUI thread đẩy control event vào
-    ``self.control_queue`` (thread-safe), worker lấy ra và gửi đi.
+    Dùng select() để kiểm tra data trước khi đọc, tránh mất đồng bộ TCP
+    do timeout giữa chừng trong recv_exact.
     """
 
     frame_ready = Signal(QImage)
@@ -51,7 +85,6 @@ class NetworkWorker(QThread):
 
     def stop(self) -> None:
         self._running = False
-        # Đóng socket để recv đang block thoát ra ngay.
         if self._sock is not None:
             try:
                 self._sock.shutdown(socket.SHUT_RDWR)
@@ -63,29 +96,33 @@ class NetworkWorker(QThread):
                 pass
 
     def send_control(self, event: dict) -> None:
-        """Gọi từ GUI thread — chỉ bỏ event vào queue, không chạm socket."""
         if self._running:
             self.control_queue.put(event)
 
-    def run(self) -> None:  # chạy trong thread riêng
+    def run(self) -> None:
+        sock: socket.socket | None = None
         try:
             self.status.emit(f"Đang kết nối tới {self.host}:{self.port} ...")
-            self._sock = socket.create_connection((self.host, self.port), timeout=10)
-            # Timeout ngắn để vòng recv định kỳ flush control queue & check _running.
-            self._sock.settimeout(0.05)
+            sock = socket.create_connection((self.host, self.port), timeout=10)
 
-            protocol.send_json(self._sock, protocol.PKT_HELLO, {"token": self.token})
+            # CHẾ ĐỘ BLOCKING — dùng select() để check data trước khi đọc,
+            # tránh timeout giữa chừng gây mất đồng bộ TCP.
+            sock.setblocking(True)
+
+            protocol.send_json(sock, protocol.PKT_HELLO, {"token": self.token})
+            log.debug("Đã gửi HELLO tới %s:%d", self.host, self.port)
 
             self.status.emit("Đã gửi token, chờ host xác thực ...")
+            self._sock = sock
             self._recv_loop()
         except OSError as exc:
             self.disconnected.emit(f"Không kết nối được: {exc}")
         except Exception as exc:  # noqa: BLE001
             self.disconnected.emit(f"Lỗi: {exc}")
         finally:
-            if self._sock is not None:
+            if sock is not None:
                 try:
-                    self._sock.close()
+                    sock.close()
                 except OSError:
                     pass
 
@@ -95,17 +132,25 @@ class NetworkWorker(QThread):
             # 1) flush control event đang chờ gửi.
             self._flush_control()
 
-            # 2) thử nhận 1 packet (non-blocking-ish nhờ timeout ngắn).
+            # 2) chờ dữ liệu với timeout ngắn (để check _running + control queue).
+            ready, _, _ = select.select([self._sock], [], [], 0.05)
+            if not ready:
+                continue
+
+            # 3) có dữ liệu — đọc 1 packet (blocking, không timeout giữa chừng).
             try:
                 ptype, payload = protocol.recv_packet(self._sock)
-            except socket.timeout:
-                continue
+            except ValueError as exc:
+                log.error("Lỗi protocol: %s", exc)
+                self.disconnected.emit(f"Lỗi: {exc}")
+                return
             except (ConnectionError, OSError) as exc:
                 if self._running:
                     self.disconnected.emit(f"Mất kết nối: {exc}")
                 return
 
             if ptype == protocol.PKT_FRAME:
+                log.debug("Nhận frame: %d bytes", len(payload))
                 self._handle_frame(payload)
             elif ptype == protocol.PKT_INFO:
                 try:
@@ -116,6 +161,7 @@ class NetworkWorker(QThread):
                 if info.get("type") == "error":
                     self.disconnected.emit(f"Host từ chối: {msg}")
                     return
+                log.info("Kết nối thành công — %s", msg)
                 self.status.emit(f"Đã kết nối — {msg}")
 
     def _flush_control(self) -> None:
@@ -127,27 +173,27 @@ class NetworkWorker(QThread):
                 return
             try:
                 protocol.send_json(self._sock, protocol.PKT_CONTROL, event)
+                log.debug("Gửi control: %s", event.get("event"))
             except OSError:
                 return
 
     def _handle_frame(self, payload: bytes) -> None:
         arr = np.frombuffer(payload, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)  # BGR
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
             return
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         h, w, _ = img.shape
-        # QImage không copy buffer ngay → .copy() để an toàn khi numpy array bị GC.
         qimg = QImage(img.data, w, h, 3 * w, QImage.Format_RGB888).copy()
         self.frame_ready.emit(qimg)
 
 
-class RemoteView(QLabel):
-    """QLabel hiển thị frame + bắt mouse, chuyển sang toạ độ normalized (0..1).
+# ---------------------------------------------------------------------------
+# Remote view
+# ---------------------------------------------------------------------------
 
-    Ảnh được letterbox (giữ aspect ratio) trong widget. Toạ độ normalized tính
-    theo vùng ảnh thực sự vẽ ra, không theo kích thước widget → click đúng chỗ.
-    """
+class RemoteView(QLabel):
+    """QLabel hiển thị frame + bắt mouse, chuyển sang toạ độ normalized (0..1)."""
 
     mouse_event = Signal(dict)
 
@@ -157,10 +203,9 @@ class RemoteView(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("background-color: #101010; color: #aaa;")
         self.setText("Chưa kết nối")
-        self.setMouseTracking(True)  # nhận mouseMove cả khi không nhấn nút
+        self.setMouseTracking(True)
 
         self._pixmap: QPixmap | None = None
-        # Hình chữ nhật vùng ảnh đã letterbox: (x, y, w, h) trong toạ độ widget.
         self._draw_rect = (0, 0, 0, 0)
 
     def set_frame(self, qimg: QImage) -> None:
@@ -171,10 +216,10 @@ class RemoteView(QLabel):
 
     def clear_frame(self, text: str) -> None:
         self._pixmap = None
-        self.setPixmap(QPixmap())  # xoá ảnh cũ
+        self.setPixmap(QPixmap())
         self.setText(text)
 
-    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+    def resizeEvent(self, event) -> None:
         self._rescale()
         super().resizeEvent(event)
 
@@ -184,13 +229,10 @@ class RemoteView(QLabel):
         area = self.size()
         scaled = self._pixmap.scaled(
             area, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        # Vị trí letterbox (căn giữa).
         x = (area.width() - scaled.width()) // 2
         y = (area.height() - scaled.height()) // 2
         self._draw_rect = (x, y, scaled.width(), scaled.height())
         self.setPixmap(scaled)
-
-    # ---- map toạ độ + emit event ----------------------------------------
 
     def _normalized(self, pos) -> tuple[float, float] | None:
         if self._pixmap is None:
@@ -201,7 +243,7 @@ class RemoteView(QLabel):
         nx = (pos.x() - x0) / w
         ny = (pos.y() - y0) / h
         if nx < 0 or nx > 1 or ny < 0 or ny > 1:
-            return None  # con trỏ ngoài vùng ảnh (vùng letterbox đen)
+            return None
         return nx, ny
 
     @staticmethod
@@ -212,26 +254,30 @@ class RemoteView(QLabel):
             return "right"
         return None
 
-    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+    def mouseMoveEvent(self, event) -> None:
         coord = self._normalized(event.position())
         if coord:
             self.mouse_event.emit(
                 {"event": "mouse_move", "x": coord[0], "y": coord[1]})
 
-    def mousePressEvent(self, event) -> None:  # noqa: N802
+    def mousePressEvent(self, event) -> None:
         coord = self._normalized(event.position())
         btn = self._button_name(event.button())
         if coord and btn:
             self.mouse_event.emit(
                 {"event": "mouse_down", "button": btn, "x": coord[0], "y": coord[1]})
 
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+    def mouseReleaseEvent(self, event) -> None:
         coord = self._normalized(event.position())
         btn = self._button_name(event.button())
         if coord and btn:
             self.mouse_event.emit(
                 {"event": "mouse_up", "button": btn, "x": coord[0], "y": coord[1]})
 
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -264,6 +310,9 @@ class MainWindow(QMainWindow):
         self.view.mouse_event.connect(self._on_mouse_event)
         self.status_label = QLabel("Trạng thái: Disconnected")
         self.status_label.setStyleSheet("padding: 4px;")
+        # Cho phép copy text.
+        self.status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -272,8 +321,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status_label)
         self.setCentralWidget(central)
         self.resize(1100, 720)
-
-    # ---- connect / disconnect -------------------------------------------
 
     def _toggle_connection(self) -> None:
         if self.worker is None:
@@ -293,6 +340,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Trạng thái: Cần nhập Host và Token")
             return
 
+        log.info("Đang kết nối tới %s:%d ...", host, port)
         self.worker = NetworkWorker(host, port, token)
         self.worker.frame_ready.connect(self.view.set_frame)
         self.worker.status.connect(
@@ -305,6 +353,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Trạng thái: Connecting...")
 
     def _disconnect(self, reason: str) -> None:
+        log.info("Ngắt kết nối: %s", reason)
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(2000)
@@ -315,7 +364,6 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Trạng thái: Disconnected ({reason})")
 
     def _on_disconnected(self, reason: str) -> None:
-        # Worker tự báo lỗi/đóng → dọn dẹp về trạng thái Connect.
         self._disconnect(reason)
 
     def _set_form_enabled(self, enabled: bool) -> None:
@@ -326,14 +374,29 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self.worker.send_control(event)
 
-    def closeEvent(self, event) -> None:  # noqa: N802
+    def closeEvent(self, event) -> None:
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(2000)
         super().closeEvent(event)
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Remote desktop CLIENT (PySide6).")
+    p.add_argument("--debug", action="store_true", help="Bật log debug chi tiết.")
+    return p.parse_args(argv)
+
+
 def main() -> int:
+    args = parse_args()
+    _setup_logging(args.debug)
+
+    log.info("=== Remote Desktop Client ===")
+
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()

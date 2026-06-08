@@ -19,6 +19,7 @@ import random
 import string
 import subprocess
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QObject, QThread, Signal
 from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap, QColor, QTextCursor
@@ -103,12 +104,29 @@ class QtLogHandler(logging.Handler):
         _log_signal.emit_log.emit(msg)
 
 
-def _setup_logging() -> None:
+def _setup_logging(debug: bool) -> None:
+    level = logging.DEBUG if debug else logging.INFO
+    fmt = "%(asctime)s [%(levelname)s] %(message)s"
+
+    logging.getLogger().setLevel(level)
+
+    # File handler.
+    logs_dir = Path(__file__).resolve().parent / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    fh = logging.FileHandler(logs_dir / "host.log", encoding="utf-8")
+    fh.setLevel(level)
+    fh.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
+    logging.getLogger().addHandler(fh)
+
+    # Qt signal handler (cho GUI).
     handler = QtLogHandler()
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
     logging.getLogger().addHandler(handler)
-    logging.getLogger().setLevel(logging.INFO)
+
+    log.info("Host log file: %s", logs_dir / "host.log")
+    if debug:
+        log.info("DEBUG mode ON")
 
 
 # ---------------------------------------------------------------------------
@@ -358,12 +376,14 @@ def parse_gui_args(argv=None) -> argparse.Namespace:
                    help="Resize xuống nếu rộng hơn (giữ aspect ratio).")
     p.add_argument("--view-only", action="store_true",
                    help="Chỉ stream, không nhận control.")
+    p.add_argument("--debug", action="store_true",
+                   help="Bật log debug chi tiết.")
     return p.parse_args(argv)
 
 
 def main() -> int:
-    _setup_logging()
     args = parse_gui_args()
+    _setup_logging(args.debug)
 
     if not args.token:
         args.token = "".join(random.choices(string.ascii_letters + string.digits, k=12))
