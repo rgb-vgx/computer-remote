@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Remote Desktop Host
+Comment=Chạy host remote desktop, click để bắt đầu
+Exec=/home/thuyetmt/work/learn/MyAnyDesk/python-remote-mvp/.venv/bin/python /home/thuyetmt/work/learn/MyAnyDesk/python-remote-mvp/host_gui.py
+Path=/home/thuyetmt/work/learn/MyAnyDesk/python-remote-mvp
+Icon=computer
+Terminal=false
+Categories=Network;Utility;
+StartupNotify=true
