@@ -199,9 +199,15 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Chưa chạy")
         self.status_label.setStyleSheet("font-weight: bold; padding: 4px;")
         status_layout.addWidget(self.status_label)
+        btn_row = QHBoxLayout()
         self.start_stop_btn = QPushButton("Bắt đầu")
         self.start_stop_btn.clicked.connect(self._toggle_server)
-        status_layout.addWidget(self.start_stop_btn)
+        btn_row.addWidget(self.start_stop_btn)
+        self.quit_btn = QPushButton("Thoát")
+        self.quit_btn.setStyleSheet("color: red;")
+        self.quit_btn.clicked.connect(self._quit_app)
+        btn_row.addWidget(self.quit_btn)
+        status_layout.addLayout(btn_row)
         layout.addWidget(status_group)
 
         # Log
@@ -283,6 +289,15 @@ class MainWindow(QMainWindow):
         self.start_stop_btn.setText("Bắt đầu")
         self.token_edit.setEnabled(True)
         self.status_label.setText("Đã dừng")
+
+    def _quit_app(self) -> None:
+        if self.tray_manager:
+            self.tray_manager._quit()
+        else:
+            if self.server_thread is not None:
+                self.server_thread.stop()
+                self.server_thread.wait(3000)
+            QApplication.quit()
 
     def closeEvent(self, event) -> None:
         if self.server_thread is not None:
@@ -367,7 +382,8 @@ class TrayManager:
             self.window.activateWindow()
 
     def _on_activated(self, reason) -> None:
-        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
             self._toggle_window()
 
     def _quit(self) -> None:
