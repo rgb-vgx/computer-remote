@@ -1,0 +1,177 @@
+# python-remote-mvp
+
+Một bản **MVP remote desktop bằng Python** viết để **học nguyên lý hoạt động**:
+host chụp màn hình → stream JPEG qua TCP → client hiển thị; client bắt mouse →
+gửi event về host → host inject vào desktop.
+
+- **Host / remote**: Kubuntu (X11). Chụp màn hình + nhận input.
+- **Client / viewer**: Windows. Hiển thị + điều khiển chuột.
+- Kết nối điểm-điểm qua **Tailscale** (`100.x.y.z:7777`).
+
+---
+
+## ⚠️ Cảnh báo an toàn — đọc trước khi chạy
+
+- **Chỉ dùng trên máy mà bạn sở hữu / có toàn quyền.** Remote control = điều khiển
+  chuột trên máy thật. Không dùng để truy cập máy người khác.
+- **Không expose trực tiếp ra Internet.** Đừng forward port 7777 ra ngoài.
+  Hãy đi qua **Tailscale** (mạng riêng, mã hoá ở tầng transport).
+- Token chỉ để **tránh connect nhầm trong tailnet**, không phải lớp bảo mật mạnh.
+  Không có TLS ở tầng ứng dụng vì đã dựa vào Tailscale lo phần mã hoá.
+- **Không chạy nếu bạn chưa hiểu rủi ro của remote control.** Người cầm client
+  điều khiển được chuột máy host.
+- App **chạy foreground, log rõ ràng, không tự khởi động, không chạy ẩn, không
+  persistence, không keylogger.** Muốn dừng: đóng cửa sổ / Ctrl+C.
+
+---
+
+## 1. Cài đặt trên Kubuntu (HOST)
+
+```bash
+sudo apt update
+sudo apt install python3-venv python3-pip
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+> Host **bắt buộc chạy trong một desktop session X11** (khuyến nghị
+> **Plasma (X11)** ở màn hình đăng nhập). Mở **Konsole** từ trong desktop đó.
+> Không chạy qua SSH/TTY và không dùng Wayland.
+
+## 2. Cài đặt trên Windows (CLIENT)
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+## 3. Chạy HOST (Kubuntu)
+
+```bash
+python host.py --bind 0.0.0.0 --port 7777 --token "change-me" --fps 8 --quality 60
+```
+
+Tham số:
+
+| Cờ | Mặc định | Ý nghĩa |
+|---|---|---|
+| `--bind` | `0.0.0.0` | Địa chỉ bind |
+| `--port` | `7777` | Cổng TCP |
+| `--token` | *(bắt buộc)* | Client phải gửi đúng mới được stream |
+| `--fps` | `8` | Frame/giây mục tiêu (5–10 hợp lý) |
+| `--quality` | `60` | Chất lượng JPEG 1–100 |
+| `--max-width` | `1280` | Resize xuống nếu rộng hơn (giữ tỉ lệ) |
+| `--view-only` | *(tắt)* | Bật để chỉ xem, **không** nhận điều khiển |
+
+## 4. Lấy Tailscale IP trên Kubuntu
+
+```bash
+tailscale ip -4
+```
+
+## 5. Chạy CLIENT (Windows)
+
+```powershell
+python client.py
+```
+
+Trong cửa sổ, nhập:
+
+```text
+Host:  100.x.y.z      # Tailscale IP của Kubuntu
+Port:  7777
+Token: change-me
+```
+
+Bấm **Connect**. Di chuột / click trái / click phải trong vùng hiển thị để điều
+khiển host. Bấm **Disconnect** (hoặc đóng cửa sổ) để dừng.
+
+## 6. Nếu bật UFW trên Kubuntu
+
+Chỉ mở cổng trên interface Tailscale (không mở ra LAN/Internet):
+
+```bash
+sudo ufw allow in on tailscale0 to any port 7777 proto tcp
+```
+
+---
+
+## 7. Troubleshooting
+
+**Client không connect:**
+
+```bash
+tailscale status              # cả 2 máy thấy nhau?
+ping 100.x.y.z                # ping được Tailscale IP của host?
+ss -ltnp | grep 7777          # host có đang listen?
+```
+
+**Host không capture được màn hình:**
+
+```bash
+echo $XDG_SESSION_TYPE        # phải là 'x11'
+echo $DISPLAY                 # không được rỗng (vd ':0')
+```
+
+- Chạy trong **Konsole của desktop session**, không qua SSH/TTY.
+- Đăng nhập bằng **Plasma (X11)**, không phải Wayland.
+
+**Điều khiển chuột không hoạt động:**
+
+- Xác nhận host đang ở X11 (xem trên).
+- Kiểm tra quyền input (pynput cần X11 session hợp lệ).
+- Thử chạy host + client trên **cùng một máy Kubuntu** trước để loại trừ vấn đề mạng.
+- Kiểm tra không bật `--view-only`.
+
+---
+
+## 8. Kiến trúc (tóm tắt)
+
+```
+        Kubuntu HOST                              Windows CLIENT
+   ┌────────────────────┐                    ┌──────────────────────┐
+   │ mss.grab màn hình  │                    │  PySide6 GUI          │
+   │   ↓                │   TCP (Tailscale)  │   RemoteView (QLabel) │
+   │ cv2 resize+JPEG    │ ── frame (type 1) ─►  cv2.imdecode → QImage│
+   │   ↓ send_packet    │                    │                       │
+   │ [capture thread]   │                    │  bắt mouse → normalize│
+   │                    │ ◄ control (type 2)─── (0..1)  [NetworkWorker│
+   │ pynput inject      │                    │            QThread]   │
+   │ [control thread]   │   hello (type 3)   │                       │
+   └────────────────────┘   info  (type 4)   └──────────────────────┘
+```
+
+- **Protocol** (`common/protocol.py`): mỗi packet = header 5 byte
+  (`uint32 BE payload_len` + `uint8 type`) + payload. `recv_exact` xử lý
+  partial read để tránh dính/đứt packet trên TCP stream.
+- **Toạ độ normalized 0..1**: client gửi tỉ lệ theo vùng ảnh, host nhân với
+  kích thước màn hình thật → resize cửa sổ client vẫn click đúng chỗ.
+- **Threading**: host có 2 thread (capture/send, receive/control) cho mỗi client;
+  client để toàn bộ socket trong 1 QThread, GUI thread chỉ chạm UI qua Qt signal.
+
+---
+
+## 9. Giới hạn của bản MVP
+
+- Chỉ **1 client** tại một thời điểm.
+- Chỉ **X11** (không Wayland — cố ý không bypass quyền OS).
+- Codec **JPEG từng frame** (motion JPEG): tốn băng thông, không nén theo thời gian.
+- Chỉ **mouse** (move / left / right). **Chưa có keyboard.**
+- Không clipboard, không multi-monitor, không audio, không file transfer.
+- Không tự reconnect; mất kết nối thì bấm Connect lại.
+- Token đơn giản, không TLS tầng ứng dụng (dựa vào Tailscale).
+
+---
+
+## 10. Roadmap nâng cấp
+
+1. **Video codec**: thay JPEG bằng **H.264 / VP8** (nén theo thời gian → ít băng thông, mượt hơn).
+2. **Keyboard**: gửi key press khi cửa sổ client focus (kèm cảnh báo rủi ro rõ ràng).
+3. **Clipboard** đồng bộ 2 chiều.
+4. **Multi-monitor**: chọn / chuyển màn hình.
+5. **Reconnect** tự động khi rớt mạng.
+6. **Auth tốt hơn**: challenge-response, key trao đổi, rate-limit.
+7. **Transport**: QUIC / WebRTC (NAT traversal, độ trễ thấp).
+8. **Port C++/Qt** sau khi bản Python chạy ổn định (hiệu năng capture/encode).

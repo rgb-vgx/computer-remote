@@ -1,0 +1,9 @@
+# Dependencies cho remote desktop MVP.
+# Lưu ý: HOST (Kubuntu) không cần PySide6; CLIENT (Windows) không cần mss/pynput.
+# Để chung một file cho đơn giản giai đoạn học — ai muốn gọn có thể tỉa bớt.
+
+mss              # chụp màn hình (host)
+opencv-python    # encode/decode JPEG + resize (cả host & client)
+numpy            # buffer ảnh (cả host & client)
+PySide6          # GUI viewer (client)
+pynput           # inject mouse vào X11 (host)
