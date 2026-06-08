@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap, QColor, QTextCursor
+from PySide6.QtGui import QAction, QCursor, QIcon, QPainter, QPixmap, QColor, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
@@ -382,8 +382,12 @@ class TrayManager:
             self.window.activateWindow()
 
     def _on_activated(self, reason) -> None:
-        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
-                      QSystemTrayIcon.ActivationReason.DoubleClick):
+        if reason == QSystemTrayIcon.ActivationReason.Context:
+            if self.icon and self.icon.contextMenu():
+                self.icon.contextMenu().popup(QCursor.pos())
+        elif reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._toggle_window()
+        elif reason == QSystemTrayIcon.ActivationReason.Trigger:
             self._toggle_window()
 
     def _quit(self) -> None:
