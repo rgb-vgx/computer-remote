@@ -331,6 +331,11 @@ class HostServer:
                          "width": frame_w, "height": frame_h})
 
                 skip_until = 0.0
+                prev_frame: np.ndarray | None = None
+                last_send = time.time()
+                heartbeat_interval = 1.0  # gửi ít nhất 1 frame/s
+                diff_threshold = 0.0001  # MSE threshold: 0.01% thay đổi
+
                 while not client_stop.is_set() and not self.stop_event.is_set():
                     now = time.time()
                     if now < skip_until:
@@ -347,6 +352,29 @@ class HostServer:
                                   int(img.shape[0] * scale)),
                             interpolation=cv2.INTER_AREA)
 
+                    # Differential update: skip if not enough change
+                    changed = False
+                    if prev_frame is None or img.shape != prev_frame.shape:
+                        changed = True
+                    else:
+                        diff = cv2.absdiff(img, prev_frame).astype(np.float32)
+                        mse = (diff * diff).mean() / (255.0 * 255.0)
+                        changed = mse > diff_threshold
+                    prev_frame = img
+
+                    if not changed and (now - last_send) < heartbeat_interval:
+                        # Chưa đủ thay đổi, chưa đến hạn heartbeat
+                        elapsed = time.time() - t0
+                        if elapsed < frame_budget:
+                            time.sleep(frame_budget - elapsed)
+                        else:
+                            skip_until = now + frame_budget
+                        continue
+
+                    if not changed:
+                        # Đến hạn heartbeat, gửi frame hiện tại
+                        pass
+
                     if use_h264 and h264_enc:
                         data = h264_enc.encode(img)
                         if data:
@@ -361,18 +389,19 @@ class HostServer:
                         protocol.send_packet(
                             sock, protocol.PKT_FRAME, buf.tobytes())
 
+                    last_send = time.time()
                     frames_since_log += 1
                     now2 = time.time()
                     if now2 - last_log >= 5.0:
+                        fps = frames_since_log / (now2 - last_log)
+                        skipped = max(0, int(1.0 / max(0.001, frame_budget) - fps))
                         if use_h264:
-                            log.info("Stream ~%.1f FPS (H.264 %dx%d)",
-                                     frames_since_log / (now2 - last_log),
-                                     frame_w, frame_h)
+                            log.info("Stream ~%.1f FPS (H.264 %dx%d, skip ~%d)",
+                                     fps, frame_w, frame_h, skipped)
                         else:
-                            log.info("Stream ~%.1f FPS (JPEG %dx%d, q=%d)",
-                                     frames_since_log / (now2 - last_log),
-                                     img.shape[1], img.shape[0],
-                                     self.args.quality)
+                            log.info("Stream ~%.1f FPS (JPEG %dx%d, q=%d, skip ~%d)",
+                                     fps, img.shape[1], img.shape[0],
+                                     self.args.quality, skipped)
                         frames_since_log = 0
                         last_log = now2
 
@@ -380,7 +409,6 @@ class HostServer:
                     if elapsed < frame_budget:
                         time.sleep(frame_budget - elapsed)
                     else:
-                        # encode chậm hơn frame_budget → skip 1 frame
                         skip_until = now2 + frame_budget
         except (ConnectionError, OSError, struct.error) as exc:
             log.info("Capture loop dừng: %s", exc)
