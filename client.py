@@ -3,11 +3,9 @@
 
 Chức năng:
   * GUI PySide6: nhập Host IP / Port / Token, Connect / Disconnect.
-  * Nhận frame JPEG từ host, decode bằng OpenCV, hiển thị (giữ aspect ratio).
-  * Bắt mouse move / press / release trên vùng hiển thị, chuyển thành toạ độ
-    normalized (0..1) và gửi về host — resize cửa sổ vẫn điều khiển đúng.
-
-Mọi việc socket nằm trong 1 worker thread (QThread); GUI thread chỉ chạm UI.
+  * Nhận frame JPEG từ host, hiển thị.
+  * Mouse + Keyboard control.
+  * Clipboard 2 chiều.
 
 Usage:
   python client.py [--debug]
@@ -25,7 +23,7 @@ import sys
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
@@ -38,13 +36,59 @@ log = logging.getLogger("client")
 
 
 # ---------------------------------------------------------------------------
+# Key mapping (Qt → pynput)
+# ---------------------------------------------------------------------------
+
+_QT_KEY_TO_NAME = {
+    0x01000020: "shift",
+    0x01000021: "ctrl",
+    0x01000023: "alt",
+    0x01000024: "meta",
+    0x01001103: "alt_gr",
+    0x01000022: "caps_lock",
+    0x01000004: "enter",
+    0x01000005: "return",
+    0x01000001: "tab",
+    0x01000003: "backspace",
+    0x01000000: "esc",
+    0x01000006: "delete",
+    0x01000010: "home",
+    0x01000011: "end",
+    0x01000016: "page_up",
+    0x01000017: "page_down",
+    0x01000007: "insert",
+    0x01000008: "menu",
+    0x01000009: "pause",
+    0x0100000a: "print_screen",
+    0x01000012: "left",
+    0x01000013: "up",
+    0x01000014: "right",
+    0x01000015: "down",
+    0x01000030: "f1",  0x01000031: "f2",  0x01000032: "f3",
+    0x01000033: "f4",  0x01000034: "f5",  0x01000035: "f6",
+    0x01000036: "f7",  0x01000037: "f8",  0x01000038: "f9",
+    0x01000039: "f10", 0x0100003a: "f11", 0x0100003b: "f12",
+}
+
+
+def _qt_key_to_key_str(qt_key: int, text: str) -> str | None:
+    name = _QT_KEY_TO_NAME.get(qt_key)
+    if name:
+        return f"Key.{name}"
+    if text and text.isprintable():
+        return text
+    if qt_key == 0x20:  # space
+        return " "
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
 def _setup_logging(debug: bool) -> None:
     level = logging.DEBUG if debug else logging.INFO
     fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-
     logging.basicConfig(level=level, format=fmt, datefmt="%H:%M:%S")
 
     logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -64,15 +108,10 @@ def _setup_logging(debug: bool) -> None:
 # ---------------------------------------------------------------------------
 
 class NetworkWorker(QThread):
-    """Thread giữ socket: connect → hello → loop nhận frame; flush control queue.
-
-    Dùng select() để kiểm tra data trước khi đọc, tránh mất đồng bộ TCP
-    do timeout giữa chừng trong recv_exact.
-    """
-
     frame_ready = Signal(QImage)
     status = Signal(str)
     disconnected = Signal(str)
+    clipboard_from_host = Signal(str)
 
     def __init__(self, host: str, port: int, token: str) -> None:
         super().__init__()
@@ -104,9 +143,6 @@ class NetworkWorker(QThread):
         try:
             self.status.emit(f"Đang kết nối tới {self.host}:{self.port} ...")
             sock = socket.create_connection((self.host, self.port), timeout=10)
-
-            # CHẾ ĐỘ BLOCKING — dùng select() để check data trước khi đọc,
-            # tránh timeout giữa chừng gây mất đồng bộ TCP.
             sock.setblocking(True)
 
             protocol.send_json(sock, protocol.PKT_HELLO, {"token": self.token})
@@ -117,7 +153,7 @@ class NetworkWorker(QThread):
             self._recv_loop()
         except OSError as exc:
             self.disconnected.emit(f"Không kết nối được: {exc}")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.disconnected.emit(f"Lỗi: {exc}")
         finally:
             if sock is not None:
@@ -129,15 +165,12 @@ class NetworkWorker(QThread):
     def _recv_loop(self) -> None:
         assert self._sock is not None
         while self._running:
-            # 1) flush control event đang chờ gửi.
             self._flush_control()
 
-            # 2) chờ dữ liệu với timeout ngắn (để check _running + control queue).
             ready, _, _ = select.select([self._sock], [], [], 0.05)
             if not ready:
                 continue
 
-            # 3) có dữ liệu — đọc 1 packet (blocking, không timeout giữa chừng).
             try:
                 ptype, payload = protocol.recv_packet(self._sock)
             except ValueError as exc:
@@ -152,6 +185,8 @@ class NetworkWorker(QThread):
             if ptype == protocol.PKT_FRAME:
                 log.debug("Nhận frame: %d bytes", len(payload))
                 self._handle_frame(payload)
+            elif ptype == protocol.PKT_CONTROL:
+                self._handle_control(payload)
             elif ptype == protocol.PKT_INFO:
                 try:
                     info = protocol.decode_json(payload)
@@ -187,15 +222,25 @@ class NetworkWorker(QThread):
         qimg = QImage(img.data, w, h, 3 * w, QImage.Format_RGB888).copy()
         self.frame_ready.emit(qimg)
 
+    def _handle_control(self, payload: bytes) -> None:
+        try:
+            event = protocol.decode_json(payload)
+        except Exception:
+            return
+        kind = event.get("event")
+        if kind == "clipboard":
+            text = event.get("text", "")
+            if text:
+                self.clipboard_from_host.emit(text)
+
 
 # ---------------------------------------------------------------------------
-# Remote view
+# Remote view (mouse + keyboard)
 # ---------------------------------------------------------------------------
 
 class RemoteView(QLabel):
-    """QLabel hiển thị frame + bắt mouse, chuyển sang toạ độ normalized (0..1)."""
-
     mouse_event = Signal(dict)
+    key_event = Signal(dict)
 
     def __init__(self) -> None:
         super().__init__()
@@ -204,6 +249,8 @@ class RemoteView(QLabel):
         self.setStyleSheet("background-color: #101010; color: #aaa;")
         self.setText("Chưa kết nối")
         self.setMouseTracking(True)
+        # Cho phép nhận key event.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self._pixmap: QPixmap | None = None
         self._draw_rect = (0, 0, 0, 0)
@@ -213,6 +260,7 @@ class RemoteView(QLabel):
         self.setText("")
         self._rescale()
         self.update()
+        self.setFocus()
 
     def clear_frame(self, text: str) -> None:
         self._pixmap = None
@@ -265,14 +313,30 @@ class RemoteView(QLabel):
         btn = self._button_name(event.button())
         if coord and btn:
             self.mouse_event.emit(
-                {"event": "mouse_down", "button": btn, "x": coord[0], "y": coord[1]})
+                {"event": "mouse_down", "button": btn,
+                 "x": coord[0], "y": coord[1]})
 
     def mouseReleaseEvent(self, event) -> None:
         coord = self._normalized(event.position())
         btn = self._button_name(event.button())
         if coord and btn:
             self.mouse_event.emit(
-                {"event": "mouse_up", "button": btn, "x": coord[0], "y": coord[1]})
+                {"event": "mouse_up", "button": btn,
+                 "x": coord[0], "y": coord[1]})
+
+    # ---- Keyboard --------------------------------------------------------
+
+    def keyPressEvent(self, event) -> None:
+        key_str = _qt_key_to_key_str(event.key(), event.text())
+        if key_str:
+            self.key_event.emit({"event": "key_down", "key": key_str})
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:
+        key_str = _qt_key_to_key_str(event.key(), event.text())
+        if key_str:
+            self.key_event.emit({"event": "key_up", "key": key_str})
+        super().keyReleaseEvent(event)
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +349,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Remote Desktop Client (MVP)")
         self.worker: NetworkWorker | None = None
 
-        # ---- form kết nối ----
+        # Clipboard state
+        self._last_clipboard = ""
+        self._clipboard_skip = 0
+
+        # ---- form ----
         self.host_edit = QLineEdit("100.")
         self.host_edit.setPlaceholderText("Tailscale IP, vd 100.x.y.z")
         self.port_edit = QLineEdit("7777")
@@ -305,12 +373,12 @@ class MainWindow(QMainWindow):
         form.addWidget(self.token_edit)
         form.addWidget(self.connect_btn)
 
-        # ---- vùng hiển thị + status ----
+        # ---- view + status ----
         self.view = RemoteView()
         self.view.mouse_event.connect(self._on_mouse_event)
+        self.view.key_event.connect(self._on_key_event)
         self.status_label = QLabel("Trạng thái: Disconnected")
         self.status_label.setStyleSheet("padding: 4px;")
-        # Cho phép copy text.
         self.status_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
 
@@ -321,6 +389,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status_label)
         self.setCentralWidget(central)
         self.resize(1100, 720)
+
+        # ---- clipboard timer ----
+        self._clipboard_timer = QTimer(self)
+        self._clipboard_timer.timeout.connect(self._check_clipboard)
 
     def _toggle_connection(self) -> None:
         if self.worker is None:
@@ -346,14 +418,21 @@ class MainWindow(QMainWindow):
         self.worker.status.connect(
             lambda m: self.status_label.setText(f"Trạng thái: {m}"))
         self.worker.disconnected.connect(self._on_disconnected)
+        self.worker.clipboard_from_host.connect(self._on_clipboard_from_host)
         self.worker.start()
 
         self.connect_btn.setText("Disconnect")
         self._set_form_enabled(False)
         self.status_label.setText("Trạng thái: Connecting...")
 
+        # Start clipboard polling
+        self._last_clipboard = ""
+        self._clipboard_skip = 0
+        self._clipboard_timer.start(500)
+
     def _disconnect(self, reason: str) -> None:
         log.info("Ngắt kết nối: %s", reason)
+        self._clipboard_timer.stop()
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(2000)
@@ -374,11 +453,38 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self.worker.send_control(event)
 
+    def _on_key_event(self, event: dict) -> None:
+        if self.worker is not None:
+            self.worker.send_control(event)
+            log.debug("Key: %s %s", event.get("event"), event.get("key"))
+
     def closeEvent(self, event) -> None:
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(2000)
         super().closeEvent(event)
+
+    # ---- Clipboard -------------------------------------------------------
+
+    def _check_clipboard(self) -> None:
+        if self._clipboard_skip > 0:
+            self._clipboard_skip -= 1
+            return
+        if self.worker is None:
+            return
+        clipboard = QApplication.clipboard()
+        text = clipboard.text()
+        if text and text != self._last_clipboard:
+            self._last_clipboard = text
+            log.debug("Client clipboard changed → gửi host (%d bytes)", len(text))
+            self.worker.send_control(
+                {"event": "clipboard", "text": text, "source": "client"})
+
+    def _on_clipboard_from_host(self, text: str) -> None:
+        self._last_clipboard = text
+        self._clipboard_skip = 2  # skip next 2 polls (~1s)
+        QApplication.clipboard().setText(text)
+        log.debug("Clipboard từ host → set client (%d bytes)", len(text))
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +500,6 @@ def parse_args(argv=None) -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     _setup_logging(args.debug)
-
     log.info("=== Remote Desktop Client ===")
 
     app = QApplication(sys.argv)
