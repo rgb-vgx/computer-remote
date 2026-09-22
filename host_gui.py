@@ -295,28 +295,18 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Đã dừng")
 
     def _quit_app(self) -> None:
-        if self.tray_manager:
-            self.tray_manager._quit()
-        else:
-            if self.server_thread is not None:
-                self.server_thread.stop()
-                self.server_thread.wait(3000)
-            QApplication.quit()
+        if self.server_thread is not None:
+            self.server_thread.stop()
+            self.server_thread.wait(3000)
+            self.server_thread = None
+        if self.tray_manager and self.tray_manager.icon:
+            self.tray_manager.icon.hide()
+        QApplication.quit()
 
     def closeEvent(self, event) -> None:
-        if self.server_thread is not None:
-            event.ignore()
-            self.hide()
-            if self.tray_manager and self.tray_manager.icon:
-                self.tray_manager.icon.showMessage(
-                    "Remote Desktop Host",
-                    "App đang chạy ẩn dưới tray. Chuột phải để thoát.",
-                    QSystemTrayIcon.MessageIcon.Information, 3000)
-        else:
-            if self.tray_manager:
-                self.tray_manager._quit()
-            else:
-                event.accept()
+        # Ấn X là thoát hẳn (dừng server), không ẩn xuống tray.
+        self._quit_app()
+        event.accept()
 
     # ---- Clipboard -------------------------------------------------------
 
@@ -398,10 +388,7 @@ class TrayManager:
             self._show_menu()
 
     def _quit(self) -> None:
-        if self.window.server_thread is not None:
-            self.window.server_thread.stop()
-            self.window.server_thread.wait(3000)
-        QApplication.quit()
+        self.window._quit_app()
 
 
 # ---------------------------------------------------------------------------
