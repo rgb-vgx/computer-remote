@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 logs/*.log
+dist/
+build/
+release/
+*.spec

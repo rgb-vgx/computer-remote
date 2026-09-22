@@ -153,7 +153,51 @@ echo $DISPLAY                 # không được rỗng (vd ':0')
 
 ---
 
-## 9. Giới hạn của bản MVP
+## 9. Đóng gói release
+
+### Tự build trên máy của bạn
+
+```bash
+source .venv/bin/activate
+pip install -r packaging/requirements-build.txt
+python packaging/build.py            # build tất cả target hợp với OS hiện tại
+```
+
+Kết quả: `dist/<target>/` (chạy trực tiếp) và
+`release/<target>-<version>-<os>-<arch>.(tar.gz|zip)`.
+
+| Target | OS | File chạy |
+|---|---|---|
+| `remote-host` | Linux | `remote-host` (CLI) |
+| `remote-host-gui` | Linux | `remote-host-gui` (GUI/tray) |
+| `remote-client` | Linux, Windows | `remote-client` / `remote-client.exe` |
+
+### Release tự động qua GitHub Actions
+
+Push tag `v*` → workflow `.github/workflows/release.yml` build trên
+`ubuntu-latest` (host + client) và `windows-latest` (client), rồi tạo GitHub
+Release kèm tất cả file:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Chạy tay không cần tag: **Actions → Release → Run workflow** (chỉ tạo artifacts).
+
+Lưu ý khi dùng bản đóng gói:
+
+- **H.264 cần `ffmpeg` cài sẵn** trên máy chạy host (không bundle trong release);
+  thiếu ffmpeg thì tự fallback JPEG.
+- Bản Linux build trên Ubuntu 24.04 → cần **glibc ≥ 2.39** (Ubuntu 24.04+,
+  Debian 13+). Máy cũ hơn chạy từ source.
+- Log ghi cạnh file thực thi: `<thư mục app>/logs/{host,client}.log`.
+- File Windows chưa ký số nên SmartScreen có thể cảnh báo — chọn
+  *More info → Run anyway*.
+
+---
+
+## 10. Giới hạn của bản MVP
 
 - Chỉ **1 client** tại một thời điểm.
 - Chỉ **X11** (không Wayland — cố ý không bypass quyền OS).
@@ -165,7 +209,7 @@ echo $DISPLAY                 # không được rỗng (vd ':0')
 
 ---
 
-## 10. Roadmap nâng cấp
+## 11. Roadmap nâng cấp
 
 1. **Video codec**: thay JPEG bằng **H.264 / VP8** (nén theo thời gian → ít băng thông, mượt hơn).
 2. **Keyboard**: gửi key press khi cửa sổ client focus (kèm cảnh báo rủi ro rõ ràng).
