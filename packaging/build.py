@@ -176,6 +176,10 @@ def human(n: int) -> str:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("targets", nargs="*", choices=sorted(TARGETS),
                    help="Target cần build (mặc định: tất cả theo OS hiện tại)")
