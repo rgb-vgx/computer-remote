@@ -128,8 +128,8 @@ class H264Decoder:
 
 _QT_KEY_TO_NAME = {
     0x01000020: "shift", 0x01000021: "ctrl", 0x01000023: "alt",
-    0x01000024: "meta", 0x01001103: "alt_gr", 0x01000022: "caps_lock",
-    0x01000004: "enter", 0x01000005: "return", 0x01000001: "tab",
+    0x01000024: "cmd", 0x01001103: "alt_gr", 0x01000022: "caps_lock",
+    0x01000004: "enter", 0x01000005: "enter", 0x01000001: "tab",
     0x01000003: "backspace", 0x01000000: "esc", 0x01000006: "delete",
     0x01000010: "home", 0x01000011: "end", 0x01000016: "page_up",
     0x01000017: "page_down", 0x01000007: "insert", 0x01000008: "menu",
@@ -248,7 +248,7 @@ class NetworkWorker(QThread):
         while self._running:
             self._flush_control()
 
-            ready, _, _ = select.select([self._sock], [], [], 0.05)
+            ready, _, _ = select.select([self._sock], [], [], 0.01)
             if not ready:
                 continue
 

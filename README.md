@@ -60,9 +60,9 @@ Tham số:
 | `--bind` | `0.0.0.0` | Địa chỉ bind |
 | `--port` | `7777` | Cổng TCP |
 | `--token` | *(bắt buộc)* | Client phải gửi đúng mới được stream |
-| `--fps` | `8` | Frame/giây mục tiêu (5–10 hợp lý) |
-| `--quality` | `60` | Chất lượng JPEG 1–100 |
-| `--max-width` | `1280` | Resize xuống nếu rộng hơn (giữ tỉ lệ) |
+| `--fps` | `15` | Frame/giây mục tiêu (10–15 hợp lý) |
+| `--quality` | `75` | Chất lượng JPEG 1–100 |
+| `--max-width` | `1920` | Resize xuống nếu rộng hơn (giữ tỉ lệ) |
 | `--view-only` | *(tắt)* | Bật để chỉ xem, **không** nhận điều khiển |
 
 ## 4. Lấy Tailscale IP trên Kubuntu
@@ -148,6 +148,9 @@ echo $DISPLAY                 # không được rỗng (vd ':0')
   partial read để tránh dính/đứt packet trên TCP stream.
 - **Toạ độ normalized 0..1**: client gửi tỉ lệ theo vùng ảnh, host nhân với
   kích thước màn hình thật → resize cửa sổ client vẫn click đúng chỗ.
+- **Chỉ gửi frame khi có thay đổi**: host so khớp pixel chính xác với frame
+  trước (màn hình tĩnh cho frame giống hệt nhau) → không tốn băng thông, vẫn
+  bắt được thay đổi nhỏ như con trỏ soạn thảo; heartbeat 1 frame/s khi tĩnh.
 - **Threading**: host có 2 thread (capture/send, receive/control) cho mỗi client;
   client để toàn bộ socket trong 1 QThread, GUI thread chỉ chạm UI qua Qt signal.
 

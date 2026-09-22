@@ -141,31 +141,6 @@ def _clipboard_get_xclip() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Key mapping
-# ---------------------------------------------------------------------------
-
-QT_KEY_TO_NAME = {
-    0x01000020: "shift", 0x01000021: "ctrl", 0x01000023: "alt",
-    0x01000024: "meta", 0x01001103: "alt_gr", 0x01000022: "caps_lock",
-    0x01000004: "enter", 0x01000005: "return", 0x01000001: "tab",
-    0x01000003: "backspace", 0x01000000: "esc", 0x01000006: "delete",
-    0x01000010: "home", 0x01000011: "end", 0x01000016: "page_up",
-    0x01000017: "page_down", 0x01000007: "insert", 0x01000008: "menu",
-    0x01000009: "pause", 0x0100000a: "print_screen",
-    0x01000012: "left", 0x01000013: "up", 0x01000014: "right",
-    0x01000015: "down",
-    0x01000030: "f1",  0x01000031: "f2",  0x01000032: "f3",
-    0x01000033: "f4",  0x01000034: "f5",  0x01000035: "f6",
-    0x01000036: "f7",  0x01000037: "f8",  0x01000038: "f9",
-    0x01000039: "f10", 0x0100003a: "f11", 0x0100003b: "f12",
-}
-
-
-def _qt_key_to_name(qt_key: int) -> str | None:
-    return QT_KEY_TO_NAME.get(qt_key)
-
-
-# ---------------------------------------------------------------------------
 # Environment check
 # ---------------------------------------------------------------------------
 
@@ -240,6 +215,10 @@ class HostServer:
 
     def _handle_client(self, sock: socket.socket, addr) -> None:
         sock.settimeout(10.0)
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
         ptype, payload = protocol.recv_packet(sock)
         if ptype != protocol.PKT_HELLO:
             log.warning("Client %s gửi packet không phải hello", addr)
@@ -334,7 +313,8 @@ class HostServer:
                 prev_frame: np.ndarray | None = None
                 last_send = time.time()
                 heartbeat_interval = 1.0  # gửi ít nhất 1 frame/s
-                diff_threshold = 0.0001  # MSE threshold: 0.01% thay đổi
+                frame_ms_total = 0.0
+                frame_ms_count = 0
 
                 while not client_stop.is_set() and not self.stop_event.is_set():
                     now = time.time()
@@ -344,7 +324,7 @@ class HostServer:
 
                     t0 = now
                     raw = sct.grab(monitor)
-                    img = np.asarray(raw)[:, :, :3]
+                    img = np.ascontiguousarray(np.asarray(raw)[:, :, :3])
                     if img.shape[1] > self.args.max_width:
                         scale = self.args.max_width / img.shape[1]
                         img = cv2.resize(
@@ -352,14 +332,12 @@ class HostServer:
                                   int(img.shape[0] * scale)),
                             interpolation=cv2.INTER_AREA)
 
-                    # Differential update: skip if not enough change
-                    changed = False
-                    if prev_frame is None or img.shape != prev_frame.shape:
-                        changed = True
-                    else:
-                        diff = cv2.absdiff(img, prev_frame).astype(np.float32)
-                        mse = (diff * diff).mean() / (255.0 * 255.0)
-                        changed = mse > diff_threshold
+                    # Differential update: màn hình tĩnh cho frame giống hệt
+                    # nhau nên chỉ cần so khớp chính xác — bắt được cả thay
+                    # đổi nhỏ (con trỏ soạn thảo, text) mà ngưỡng MSE bỏ sót.
+                    changed = (prev_frame is None
+                               or img.shape != prev_frame.shape
+                               or not np.array_equal(img, prev_frame))
                     prev_frame = img
 
                     if not changed and (now - last_send) < heartbeat_interval:
@@ -390,19 +368,24 @@ class HostServer:
                             sock, protocol.PKT_FRAME, buf.tobytes())
 
                     last_send = time.time()
+                    frame_ms_total += (last_send - t0) * 1000.0
+                    frame_ms_count += 1
                     frames_since_log += 1
                     now2 = time.time()
                     if now2 - last_log >= 5.0:
                         fps = frames_since_log / (now2 - last_log)
+                        avg_ms = frame_ms_total / max(1, frame_ms_count)
                         skipped = max(0, int(1.0 / max(0.001, frame_budget) - fps))
                         if use_h264:
-                            log.info("Stream ~%.1f FPS (H.264 %dx%d, skip ~%d)",
-                                     fps, frame_w, frame_h, skipped)
+                            log.info("Stream ~%.1f FPS (H.264 %dx%d, skip ~%d, %.0f ms/frame)",
+                                     fps, frame_w, frame_h, skipped, avg_ms)
                         else:
-                            log.info("Stream ~%.1f FPS (JPEG %dx%d, q=%d, skip ~%d)",
+                            log.info("Stream ~%.1f FPS (JPEG %dx%d, q=%d, skip ~%d, %.0f ms/frame)",
                                      fps, img.shape[1], img.shape[0],
-                                     self.args.quality, skipped)
+                                     self.args.quality, skipped, avg_ms)
                         frames_since_log = 0
+                        frame_ms_total = 0.0
+                        frame_ms_count = 0
                         last_log = now2
 
                     elapsed = now2 - t0
@@ -612,7 +595,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--port", type=int, default=7777)
     p.add_argument("--token", default="1")
-    p.add_argument("--fps", type=int, default=8)
+    p.add_argument("--fps", type=int, default=15)
     p.add_argument("--quality", type=int, default=75,
                    help="Chất lượng nén (JPEG: 1-100, H.264: 1-100 → CRF 51-10)")
     p.add_argument("--max-width", type=int, default=1920)

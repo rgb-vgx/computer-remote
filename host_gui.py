@@ -415,7 +415,7 @@ def parse_gui_args(argv=None) -> argparse.Namespace:
     p.add_argument("--port", type=int, default=7777, help="Cổng TCP (mặc định 7777).")
     p.add_argument("--token", default="1",
                    help="Token để client xác thực.")
-    p.add_argument("--fps", type=int, default=8, help="Số frame/giây mục tiêu.")
+    p.add_argument("--fps", type=int, default=15, help="Số frame/giây mục tiêu.")
     p.add_argument("--quality", type=int, default=75, help="Chất lượng nén (1-100).")
     p.add_argument("--max-width", type=int, default=1920,
                    help="Resize xuống nếu rộng hơn (giữ aspect ratio).")
