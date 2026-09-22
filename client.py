@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from common import protocol
+from common import app_log_dir, protocol
 
 log = logging.getLogger("client")
 
@@ -162,13 +162,15 @@ def _setup_logging(debug: bool) -> None:
     level = logging.DEBUG if debug else logging.INFO
     fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     logging.basicConfig(level=level, format=fmt, datefmt="%H:%M:%S")
-    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    fh = logging.FileHandler(os.path.join(logs_dir, "client.log"), encoding="utf-8")
-    fh.setLevel(level)
-    fh.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
-    logging.getLogger().addHandler(fh)
-    log.info("Client log file: %s", os.path.join(logs_dir, "client.log"))
+    try:
+        log_path = app_log_dir() / "client.log"
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setLevel(level)
+        fh.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
+        logging.getLogger().addHandler(fh)
+        log.info("Client log file: %s", log_path)
+    except OSError as exc:
+        log.warning("Không mở được file log: %s", exc)
     if debug:
         log.info("DEBUG mode ON")
 

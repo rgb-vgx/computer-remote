@@ -12,7 +12,6 @@ import logging
 import os
 import subprocess
 import sys
-from pathlib import Path
 
 from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QCursor, QIcon, QPainter, QPixmap, QColor, QTextCursor
@@ -22,6 +21,7 @@ from PySide6.QtWidgets import (
     QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
+from common import app_log_dir
 from host import HostServer
 
 log = logging.getLogger("host_gui")
@@ -93,19 +93,23 @@ def _setup_logging(debug: bool) -> None:
     fmt = "%(asctime)s [%(levelname)s] %(message)s"
     logging.getLogger().setLevel(level)
 
-    logs_dir = Path(__file__).resolve().parent / "logs"
-    logs_dir.mkdir(exist_ok=True)
-    fh = logging.FileHandler(logs_dir / "host.log", encoding="utf-8")
-    fh.setLevel(level)
-    fh.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
-    logging.getLogger().addHandler(fh)
+    log_path = None
+    try:
+        log_path = app_log_dir() / "host.log"
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setLevel(level)
+        fh.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
+        logging.getLogger().addHandler(fh)
+    except OSError as exc:
+        log.warning("Không mở được file log: %s", exc)
 
     handler = QtLogHandler()
     handler.setLevel(level)
     handler.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
     logging.getLogger().addHandler(handler)
 
-    log.info("Host log file: %s", logs_dir / "host.log")
+    if log_path is not None:
+        log.info("Host log file: %s", log_path)
     if debug:
         log.info("DEBUG mode ON")
 

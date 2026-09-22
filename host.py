@@ -26,7 +26,7 @@ import cv2
 import mss
 import numpy as np
 
-from common import protocol
+from common import app_log_dir, protocol
 
 log = logging.getLogger("host")
 
@@ -632,15 +632,16 @@ def main() -> int:
         datefmt="%H:%M:%S",
     )
 
-    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    fh = logging.FileHandler(os.path.join(logs_dir, "host.log"), encoding="utf-8")
-    fh.setLevel(level)
-    fh.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"))
-    logging.getLogger().addHandler(fh)
-
-    log.info("Host log file: %s", os.path.join(logs_dir, "host.log"))
+    try:
+        log_path = app_log_dir() / "host.log"
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setLevel(level)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"))
+        logging.getLogger().addHandler(fh)
+        log.info("Host log file: %s", log_path)
+    except OSError as exc:
+        log.warning("Không mở được file log: %s", exc)
     if args.debug:
         log.info("DEBUG mode ON")
 
