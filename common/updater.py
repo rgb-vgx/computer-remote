@@ -12,6 +12,7 @@ rồi ``execv`` để khởi động lại.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import re
@@ -28,6 +29,8 @@ from urllib.request import Request, urlopen
 GITHUB_REPO = "rgb-vgx/computer-remote"
 _API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 _USER_AGENT = "python-remote-mvp-updater"
+
+log = logging.getLogger("updater")
 
 _TARGET_NAMES = {
     "client": "remote-client",
@@ -258,9 +261,15 @@ def install_and_restart(archive: Path, workdir: Path) -> bool:
 
     if sys.platform == "win32":
         script = workdir / "remote-update.bat"
-        script.write_text(_WIN_SCRIPT, encoding="utf-8")
+        log_path = app_dir / "logs" / "update.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(
+            _WIN_SCRIPT.format(src=src, dst=app_dir, exe=exe.name,
+                               log=log_path, pid=os.getpid()),
+            encoding="utf-8")
+        log.info("Spawn script cập nhật: %s (log: %s)", script, log_path)
         subprocess.Popen(
-            ["cmd", "/c", str(script), str(src), str(app_dir), exe.name],
+            ["cmd", "/c", str(script)],
             creationflags=0x00000008 | 0x08000000,  # DETACHED | NO_WINDOW
             close_fds=True)
     else:
@@ -269,6 +278,7 @@ def install_and_restart(archive: Path, workdir: Path) -> bool:
             _LINUX_SCRIPT.format(src=src, dst=app_dir, exe=exe),
             encoding="utf-8")
         script.chmod(0o755)
+        log.info("Spawn script cập nhật: %s", script)
         subprocess.Popen(["/bin/sh", str(script), str(os.getpid())],
                          start_new_session=True, close_fds=True)
     return True
@@ -277,33 +287,57 @@ def install_and_restart(archive: Path, workdir: Path) -> bool:
 _LINUX_SCRIPT = """#!/bin/sh
 # Chờ app thoát hẳn rồi thay thư mục và mở lại (do updater sinh ra).
 PID="$1"
+mkdir -p "{dst}/logs" 2>/dev/null || true
+LOG="{dst}/logs/update.log"
+echo "$(date '+%F %T') update start pid=$PID src={src} dst={dst}" > "$LOG"
 i=0
 while kill -0 "$PID" 2>/dev/null; do
     i=$((i + 1))
-    [ "$i" -gt 100 ] && break
+    if [ "$i" -gt 100 ]; then
+        echo "$(date '+%F %T') timeout - app chua thoat" >> "$LOG"
+        exit 1
+    fi
     sleep 0.2
 done
+echo "$(date '+%F %T') app exited" >> "$LOG"
 sleep 0.3
 cp -a "{dst}/logs/." "{src}/logs/" 2>/dev/null || true
 rm -rf "{dst}"
 mv "{src}" "{dst}"
+echo "$(date '+%F %T') swapped, starting {exe}" >> "{dst}/logs/update.log"
 exec "{exe}"
 """
 
+# Windows: nhúng sẵn đường dẫn + PID (không truyền tham số), gọi thẳng binary
+# trong System32 để tránh `find`/`tasklist` bị PATH hijack, và ghi log để dễ
+# chẩn đoán nếu update thất bại.
 _WIN_SCRIPT = """@echo off
 setlocal
-set "SRC=%~1"
-set "DST=%~2"
-set "EXE=%~3"
+set "SRC={src}"
+set "DST={dst}"
+set "EXE={exe}"
+set "LOG={log}"
+set "PID={pid}"
+set "SYS=%SystemRoot%\\System32"
+echo [%date% %time%] update start pid=%PID% > "%LOG%"
+echo [%date% %time%] src="%SRC%" dst="%DST%" >> "%LOG%"
+set /a N=0
 :wait
-tasklist /fi "imagename eq %EXE%" 2>nul | find /i "%EXE%" >nul
-if not errorlevel 1 (
-  ping -n 2 127.0.0.1 >nul
-  goto wait
+"%SYS%\\tasklist.exe" /fi "pid eq %PID%" 2>nul | "%SYS%\\find.exe" /i "%EXE%" >nul
+if errorlevel 1 goto ready
+set /a N+=1
+if %N% geq 150 (
+  echo [%date% %time%] timeout - app chua thoat >> "%LOG%"
+  exit /b 1
 )
-if exist "%DST%\\logs\\." xcopy "%DST%\\logs" "%SRC%\\logs\\" /E /I /Y >nul 2>&1
-robocopy "%SRC%" "%DST%" /E /R:2 /W:1 >nul
+"%SYS%\\ping.exe" -n 2 127.0.0.1 >nul
+goto wait
+:ready
+echo [%date% %time%] app exited >> "%LOG%"
+"%SYS%\\robocopy.exe" "%SRC%" "%DST%" /E /R:3 /W:1 /NFL /NDL /NP >> "%LOG%" 2>&1
+echo [%date% %time%] robocopy rc=%ERRORLEVEL% >> "%LOG%"
 start "" "%DST%\\%EXE%"
+echo [%date% %time%] started "%DST%\\%EXE%" >> "%LOG%"
 cd /d "%TEMP%"
 rmdir /s /q "%SRC%" >nul 2>&1
 del "%~f0" >nul 2>&1

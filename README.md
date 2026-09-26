@@ -215,6 +215,10 @@ không cần token), so version với bản đang chạy, tải asset đúng OS/
 - **Bản chạy source**: `git pull --ff-only` + `pip install -r requirements.txt`
   rồi khởi động lại.
 
+Nếu update trục trặc, xem `<thư mục app>/logs/update.log` (script ghi từng
+bước: chờ app thoát, robocopy/mv, rc, mở lại). CI chạy smoke test
+`packaging/smoke_update.py` trên cả Linux và Windows cho luồng này.
+
 Version hiện tại hiện trên tiêu đề cửa sổ. Bản `≤ v0.1.3` chưa có nút này —
 cần cài tay một lần, sau đó update trong app.
 

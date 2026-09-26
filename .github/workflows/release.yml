@@ -49,6 +49,10 @@ jobs:
           fi
           python packaging/build.py ${{ matrix.targets }} ${args}
 
+      - name: Smoke test auto-update
+        shell: bash
+        run: python packaging/smoke_update.py
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
