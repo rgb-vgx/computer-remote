@@ -372,6 +372,7 @@ class RemoteView(QLabel):
 
         self._pixmap: QPixmap | None = None
         self._draw_rect = (0, 0, 0, 0)
+        self._scroll_acc = [0, 0]
 
     def set_frame(self, qimg: QImage) -> None:
         self._pixmap = QPixmap.fromImage(qimg)
@@ -441,6 +442,26 @@ class RemoteView(QLabel):
             self.mouse_event.emit(
                 {"event": "mouse_up", "button": btn,
                  "x": coord[0], "y": coord[1]})
+
+    def wheelEvent(self, event) -> None:
+        coord = self._normalized(event.position())
+        if coord is None:
+            event.ignore()
+            return
+        delta = event.angleDelta()
+        if delta.isNull():
+            delta = event.pixelDelta()
+        self._scroll_acc[0] += delta.x()
+        self._scroll_acc[1] += delta.y()
+        dx = int(self._scroll_acc[0] / 120)
+        dy = int(self._scroll_acc[1] / 120)
+        if dx or dy:
+            self._scroll_acc[0] -= dx * 120
+            self._scroll_acc[1] -= dy * 120
+            self.mouse_event.emit(
+                {"event": "scroll", "x": coord[0], "y": coord[1],
+                 "dx": dx, "dy": dy})
+        event.accept()
 
     def keyPressEvent(self, event) -> None:
         key_str = _qt_key_to_key_str(event.key(), event.text())

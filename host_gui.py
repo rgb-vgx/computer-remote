@@ -12,6 +12,7 @@ import logging
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QCursor, QIcon, QPainter, QPixmap, QColor, QTextCursor
@@ -22,55 +23,59 @@ from PySide6.QtWidgets import (
 )
 
 from common import app_log_dir
-from host import HostServer
+from host import HostServer, detect_display
 
 log = logging.getLogger("host_gui")
 
 
 # ---------------------------------------------------------------------------
-# Auto-detect DISPLAY
+# Autostart (XDG autostart .desktop)
 # ---------------------------------------------------------------------------
 
-def detect_display() -> bool:
-    if os.environ.get("DISPLAY"):
-        return True
-    x11_dir = "/tmp/.X11-unix"
-    if not os.path.isdir(x11_dir):
-        return False
-    displays = sorted(
-        (s for s in os.listdir(x11_dir) if s.startswith("X") and s[1:].isdigit()),
-        key=lambda s: int(s[1:]),
+def autostart_path() -> Path:
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(config_home) / "autostart" / "remote-desktop-host.desktop"
+
+
+def _autostart_quote(arg: str) -> str:
+    if not arg or any(c in arg for c in ' \t"\'\\'):
+        return '"' + arg.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return arg
+
+
+def write_autostart(token: str) -> Path:
+    """Ghi file autostart trỏ tới app hiện tại (source hoặc bản đóng gói)."""
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).resolve()
+        workdir = exe.parent
+        cmd = [str(exe)]
+    else:
+        script = Path(__file__).resolve()
+        workdir = script.parent
+        cmd = [sys.executable, str(script)]
+    cmd += ["--token", token, "--auto-start"]
+    exec_line = " ".join(_autostart_quote(a) for a in cmd)
+    content = (
+        "[Desktop Entry]\n"
+        "Version=1.0\n"
+        "Type=Application\n"
+        "Name=Remote Desktop Host\n"
+        "Comment=Remote desktop host (autostart)\n"
+        f"Exec={exec_line}\n"
+        f"Path={workdir}\n"
+        "Icon=computer\n"
+        "Terminal=false\n"
+        "Categories=Network;Utility;\n"
+        "X-GNOME-Autostart-enabled=true\n"
     )
-    if not displays:
-        return False
-    for disp in displays:
-        dnum = disp[1:]
-        display_str = f":{dnum}"
-        xauth_paths = [
-            f"/run/sddm/xauth_nfMZXD", f"/var/run/sddm/xauth_nfMZXD",
-            os.path.expanduser("~/.Xauthority"),
-            f"/run/user/{os.getuid()}/xauth",
-        ]
-        for auth in xauth_paths:
-            if os.path.isfile(auth):
-                try:
-                    os.environ["XAUTHORITY"] = auth
-                    os.environ["DISPLAY"] = display_str
-                    log.info("Auto DISPLAY=%s (XAUTHORITY=%s)", display_str, auth)
-                    return True
-                except Exception:
-                    continue
-        os.environ["DISPLAY"] = display_str
-        try:
-            result = subprocess.run(
-                ["xdpyinfo"], capture_output=True, timeout=2,
-                env={**os.environ, "DISPLAY": display_str})
-            if result.returncode == 0:
-                log.info("Auto DISPLAY=%s", display_str)
-                return True
-        except Exception:
-            continue
-    return False
+    path = autostart_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def remove_autostart() -> None:
+    autostart_path().unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +190,7 @@ class MainWindow(QMainWindow):
         token_row.addWidget(self.token_edit)
         token_row.addWidget(self.show_token_cb)
         info_layout.addRow("Token:", token_row)
+        self.token_edit.editingFinished.connect(self._refresh_autostart_token)
         self.ip_label = QLabel(self._get_ip())
         info_layout.addRow("IP:", self.ip_label)
         self.port_label = QLabel(str(args.port))
@@ -194,6 +200,11 @@ class MainWindow(QMainWindow):
         self.codec_combo.addItems(["H.264 (cần ffmpeg)", "JPEG"])
         self.codec_combo.setCurrentIndex(0 if args.codec == "h264" else 1)
         info_layout.addRow("Codec:", self.codec_combo)
+
+        self.autostart_cb = QCheckBox("Khởi động cùng hệ thống")
+        self.autostart_cb.setChecked(autostart_path().exists())
+        self.autostart_cb.toggled.connect(self._on_autostart_toggled)
+        info_layout.addRow("", self.autostart_cb)
 
         layout.addWidget(info_group)
 
@@ -293,6 +304,32 @@ class MainWindow(QMainWindow):
         self.start_stop_btn.setText("Bắt đầu")
         self.token_edit.setEnabled(True)
         self.status_label.setText("Đã dừng")
+
+    # ---- Autostart -------------------------------------------------------
+
+    def _on_autostart_toggled(self, enabled: bool) -> None:
+        try:
+            if enabled:
+                path = write_autostart(self.token_edit.text())
+                log.info("Bật khởi động cùng hệ thống: %s", path)
+            else:
+                remove_autostart()
+                log.info("Tắt khởi động cùng hệ thống")
+        except OSError as exc:
+            log.warning("Không đổi được autostart: %s", exc)
+            QMessageBox.warning(
+                self, "Lỗi", f"Không đổi được khởi động cùng hệ thống:\n{exc}")
+            self.autostart_cb.blockSignals(True)
+            self.autostart_cb.setChecked(not enabled)
+            self.autostart_cb.blockSignals(False)
+
+    def _refresh_autostart_token(self) -> None:
+        if not self.autostart_cb.isChecked():
+            return
+        try:
+            write_autostart(self.token_edit.text())
+        except OSError as exc:
+            log.warning("Không cập nhật được autostart: %s", exc)
 
     def _quit_app(self) -> None:
         if self.server_thread is not None:

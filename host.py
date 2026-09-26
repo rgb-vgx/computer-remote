@@ -144,18 +144,69 @@ def _clipboard_get_xclip() -> str:
 # Environment check
 # ---------------------------------------------------------------------------
 
+def _probe_display() -> bool:
+    """Thử capture 1 frame để chắc chắn DISPLAY hiện tại dùng được."""
+    try:
+        with mss.MSS() as sct:
+            sct.grab(sct.monitors[1])
+        return True
+    except Exception:
+        return False
+
+
+def detect_display() -> bool:
+    """Tự dò X display khi chạy từ SSH/tty (DISPLAY trống).
+
+    Quét socket trong /tmp/.X11-unix, thử lần lượt các Xauthority khả dụng,
+    chỉ nhận display capture được thật.
+    """
+    if os.environ.get("DISPLAY"):
+        return True
+
+    x11_dir = "/tmp/.X11-unix"
+    if not os.path.isdir(x11_dir):
+        return False
+    displays = sorted(
+        (s for s in os.listdir(x11_dir) if s.startswith("X") and s[1:].isdigit()),
+        key=lambda s: int(s[1:]))
+
+    auth_candidates = [
+        os.environ.get("XAUTHORITY", ""),
+        os.path.expanduser("~/.Xauthority"),
+        f"/run/user/{os.getuid()}/xauth",
+    ]
+    for disp in displays:
+        display_str = f":{disp[1:]}"
+        for auth in auth_candidates:
+            if auth and not os.path.isfile(auth):
+                continue
+            if auth:
+                os.environ["XAUTHORITY"] = auth
+            os.environ["DISPLAY"] = display_str
+            if _probe_display():
+                log.info("Tự dò DISPLAY=%s (XAUTHORITY=%s)",
+                         display_str, auth or "mặc định")
+                return True
+        os.environ.pop("DISPLAY", None)
+    return False
+
+
 def check_display_env() -> None:
+    detected = False
+    if not os.environ.get("DISPLAY"):
+        detected = detect_display()
     session = os.environ.get("XDG_SESSION_TYPE", "")
     display = os.environ.get("DISPLAY", "")
     log.info("XDG_SESSION_TYPE=%r", session)
     log.info("DISPLAY=%r", display)
-    if session.lower() != "x11" or not display:
-        log.warning("=" * 64)
-        log.warning("CẢNH BÁO: Không phát hiện session X11 hợp lệ.")
-        log.warning("Bản MVP này cần X11 để capture & inject.")
-        log.warning("=" * 64)
-    else:
+    if display and (detected or _probe_display()):
         log.info("Session X11 OK.")
+        return
+    log.warning("=" * 64)
+    log.warning("CẢNH BÁO: Không kết nối được X11 — capture & inject sẽ lỗi.")
+    log.warning("Chạy host trong terminal của session desktop, hoặc từ SSH:")
+    log.warning("  DISPLAY=:0 python host.py ...")
+    log.warning("=" * 64)
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +522,7 @@ class HostServer:
 
     def _apply_event(self, event: dict) -> None:
         kind = event.get("event")
-        if kind in ("mouse_move", "mouse_down", "mouse_up"):
+        if kind in ("mouse_move", "mouse_down", "mouse_up", "scroll"):
             self._apply_mouse(event)
         elif kind in ("key_down", "key_up"):
             self._apply_keyboard(event)
@@ -498,6 +549,17 @@ class HostServer:
                 mouse.press(btn)
             else:
                 mouse.release(btn)
+        elif kind == "scroll":
+            x = _clamp01(event.get("x", 0.0)) * screen_w
+            y = _clamp01(event.get("y", 0.0)) * screen_h
+            mouse.position = (int(x), int(y))
+            dx = _scroll_steps(event.get("dx", 0))
+            dy = _scroll_steps(event.get("dy", 0))
+            if dx or dy:
+                try:
+                    mouse.scroll(dx, dy)
+                except Exception as exc:
+                    log.debug("Scroll inject error: %s", exc)
 
     def _apply_keyboard(self, event: dict) -> None:
         kbd = self._get_keyboard()
@@ -575,6 +637,15 @@ def _clamp01(v: float) -> float:
     except (TypeError, ValueError):
         return 0.0
     return 0.0 if v < 0.0 else 1.0 if v > 1.0 else v
+
+
+def _scroll_steps(v) -> int:
+    """Chuẩn hoá số bước cuộn, chặn giá trị bất thường từ client."""
+    try:
+        steps = int(v)
+    except (TypeError, ValueError):
+        return 0
+    return max(-50, min(50, steps))
 
 
 def _safe_close(sock) -> None:
