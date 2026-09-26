@@ -360,6 +360,8 @@ class HostServer:
         self._mouse = None
         self._keyboard = None
         self._view_only_logged = False
+        # Client có thể đổi max-width khi đang stream (set_resolution).
+        self._max_width = self._clamp_width(args.max_width)
 
         # Clipboard
         self._clipboard_send_queue: queue.Queue[str] = queue.Queue()
@@ -482,9 +484,10 @@ class HostServer:
                 shot = sct.grab(monitor)
                 first = np.asarray(shot)
                 cap_h, cap_w = first.shape[:2]
-                if cap_w > self.args.max_width:
-                    scale = self.args.max_width / cap_w
-                    frame_w, frame_h = self.args.max_width, int(cap_h * scale)
+                active_max_width = self._max_width
+                if cap_w > active_max_width:
+                    scale = active_max_width / cap_w
+                    frame_w, frame_h = active_max_width, int(cap_h * scale)
                 else:
                     frame_w, frame_h = cap_w, cap_h
 
@@ -504,6 +507,7 @@ class HostServer:
                 last_jpeg = b""
                 sent_w = sent_h = 0
                 last_send = time.time()
+                force_send = False
                 # H.264: decoder giữ 1-2 frame (parser + libavcodec), P-frame
                 # rất nhỏ nên heartbeat dày hơn để không lag khi màn hình tĩnh.
                 heartbeat_interval = 0.25 if use_h264 else 1.0
@@ -521,6 +525,33 @@ class HostServer:
                     # View BGRA trên buffer của mss — không copy.
                     frame = np.asarray(shot)
 
+                    # Client đổi độ phân giải giữa chừng?
+                    if self._max_width != active_max_width:
+                        active_max_width = self._max_width
+                        cap_w, cap_h = frame.shape[1], frame.shape[0]
+                        if cap_w > active_max_width:
+                            scale = active_max_width / cap_w
+                            frame_w = active_max_width
+                            frame_h = int(cap_h * scale)
+                        else:
+                            frame_w, frame_h = cap_w, cap_h
+                        if use_h264:
+                            frame_w -= frame_w % 2
+                            frame_h -= frame_h % 2
+                            if h264_enc:
+                                h264_enc.close()
+                            h264_enc = H264Encoder(frame_w, frame_h,
+                                                   self.args.fps,
+                                                   self.args.quality)
+                            protocol.send_json(
+                                sock, protocol.PKT_INFO,
+                                {"type": "codec", "codec": "h264",
+                                 "width": frame_w, "height": frame_h})
+                        last_jpeg = b""
+                        force_send = True
+                        log.info("Đổi độ phân giải: max-width=%d → %dx%d",
+                                 active_max_width, frame_w, frame_h)
+
                     # Differential update: màn hình tĩnh cho frame giống hệt
                     # nhau nên chỉ cần so khớp chính xác — bắt được cả thay
                     # đổi nhỏ (con trỏ soạn thảo, text) mà ngưỡng MSE bỏ sót.
@@ -529,7 +560,8 @@ class HostServer:
                                or not np.array_equal(frame, prev_frame))
                     prev_frame = frame
 
-                    if not changed and (now - last_send) < heartbeat_interval:
+                    if (not changed and not force_send
+                            and (now - last_send) < heartbeat_interval):
                         # Chưa đủ thay đổi, chưa đến hạn heartbeat
                         elapsed = time.time() - t0
                         if elapsed < frame_budget:
@@ -553,10 +585,10 @@ class HostServer:
                         # khỏi cvtColor + imencode lại.
                         if changed or not last_jpeg:
                             img = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                            if img.shape[1] > self.args.max_width:
-                                scale = self.args.max_width / img.shape[1]
+                            if img.shape[1] > active_max_width:
+                                scale = active_max_width / img.shape[1]
                                 img = cv2.resize(
-                                    img, (self.args.max_width,
+                                    img, (active_max_width,
                                           int(img.shape[0] * scale)),
                                     interpolation=cv2.INTER_AREA)
                             ok, buf = cv2.imencode(".jpg", img, encode_params)
@@ -570,6 +602,7 @@ class HostServer:
                             sock, protocol.PKT_FRAME, last_jpeg)
 
                     last_send = time.time()
+                    force_send = False
                     frame_ms_total += (last_send - t0) * 1000.0
                     frame_ms_count += 1
                     frames_since_log += 1
@@ -682,6 +715,27 @@ class HostServer:
             self._apply_keyboard(event)
         elif kind == "clipboard":
             self._apply_clipboard(event)
+        elif kind == "set_resolution":
+            self._apply_resolution(event)
+
+    def _apply_resolution(self, event: dict) -> None:
+        value = event.get("max_width")
+        if value is None:
+            # "Theo host": quay về tham số --max-width lúc khởi động.
+            width = self._clamp_width(self.args.max_width)
+        else:
+            width = self._clamp_width(value)
+        if width != self._max_width:
+            self._max_width = width
+            log.info("Client yêu cầu max-width=%d", width)
+
+    @staticmethod
+    def _clamp_width(value) -> int:
+        try:
+            width = int(value)
+        except (TypeError, ValueError):
+            return 1920
+        return max(160, min(7680, width))
 
     def _apply_mouse(self, event: dict) -> None:
         mouse = self._get_mouse()

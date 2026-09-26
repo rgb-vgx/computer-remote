@@ -25,8 +25,8 @@ import numpy as np
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
-    QVBoxLayout, QWidget,
+    QApplication, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QPushButton, QVBoxLayout, QWidget,
 )
 
 from common import app_log_dir, protocol
@@ -299,6 +299,11 @@ class NetworkWorker(QThread):
                         w = info.get("width", 0)
                         h = info.get("height", 0)
                         if w and h:
+                            # Codec info gửi lại khi host đổi độ phân giải →
+                            # tạo lại decoder cho kích thước mới.
+                            if self._h264_dec is not None:
+                                self._h264_dec.close()
+                                self._h264_dec = None
                             self._frame_w = w
                             self._frame_h = h
                             if H264Decoder.available():
@@ -517,6 +522,16 @@ class MainWindow(QMainWindow):
         self.update_btn.clicked.connect(self._check_update)
         self.updater = UpdateController(self, "client")
 
+        self.res_combo = QComboBox()
+        self.res_combo.addItem("Theo host", None)
+        for width in (3840, 1920, 1600, 1280, 1024, 800, 640):
+            self.res_combo.addItem(str(width), width)
+        self.res_combo.setToolTip(
+            "Độ phân giải stream tối đa (max-width).\n"
+            "Thấp hơn = mượt hơn, ít băng thông hơn.\n"
+            "'Theo host' = giữ nguyên tham số --max-width của host.")
+        self.res_combo.currentIndexChanged.connect(self._on_resolution_changed)
+
         form = QHBoxLayout()
         form.addWidget(QLabel("Host:"))
         form.addWidget(self.host_edit)
@@ -524,6 +539,8 @@ class MainWindow(QMainWindow):
         form.addWidget(self.port_edit)
         form.addWidget(QLabel("Token:"))
         form.addWidget(self.token_edit)
+        form.addWidget(QLabel("Độ phân giải:"))
+        form.addWidget(self.res_combo)
         form.addWidget(self.connect_btn)
         form.addWidget(self.update_btn)
 
@@ -555,6 +572,12 @@ class MainWindow(QMainWindow):
     def _check_update(self) -> None:
         self.updater.start()
 
+    def _on_resolution_changed(self) -> None:
+        if self.worker is not None:
+            self.worker.send_control(
+                {"event": "set_resolution",
+                 "max_width": self.res_combo.currentData()})
+
     def _connect(self) -> None:
         host = self.host_edit.text().strip()
         token = self.token_edit.text()
@@ -575,6 +598,10 @@ class MainWindow(QMainWindow):
         self.worker.disconnected.connect(self._on_disconnected)
         self.worker.clipboard_from_host.connect(self._on_clipboard_from_host)
         self.worker.start()
+        width = self.res_combo.currentData()
+        if width is not None:
+            self.worker.send_control(
+                {"event": "set_resolution", "max_width": width})
 
         self.connect_btn.setText("Disconnect")
         self._set_form_enabled(False)
