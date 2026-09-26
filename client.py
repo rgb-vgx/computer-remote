@@ -30,6 +30,8 @@ from PySide6.QtWidgets import (
 )
 
 from common import app_log_dir, protocol
+from common.updater import current_version
+from common.updater_qt import UpdateController
 
 log = logging.getLogger("client")
 
@@ -496,7 +498,7 @@ class RemoteView(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Remote Desktop Client (MVP)")
+        self.setWindowTitle(f"Remote Desktop Client (MVP) v{current_version()}")
         self.worker: NetworkWorker | None = None
 
         self._last_clipboard = ""
@@ -511,6 +513,9 @@ class MainWindow(QMainWindow):
         self.token_edit.setEchoMode(QLineEdit.Password)
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self._toggle_connection)
+        self.update_btn = QPushButton("Cập nhật")
+        self.update_btn.clicked.connect(self._check_update)
+        self.updater = UpdateController(self, "client")
 
         form = QHBoxLayout()
         form.addWidget(QLabel("Host:"))
@@ -520,6 +525,7 @@ class MainWindow(QMainWindow):
         form.addWidget(QLabel("Token:"))
         form.addWidget(self.token_edit)
         form.addWidget(self.connect_btn)
+        form.addWidget(self.update_btn)
 
         self.view = RemoteView()
         self.view.mouse_event.connect(self._on_mouse_event)
@@ -545,6 +551,9 @@ class MainWindow(QMainWindow):
             self._connect()
         else:
             self._disconnect("Đã ngắt bởi người dùng")
+
+    def _check_update(self) -> None:
+        self.updater.start()
 
     def _connect(self) -> None:
         host = self.host_edit.text().strip()

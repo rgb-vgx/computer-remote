@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
 )
 
 from common import app_log_dir
+from common.updater import current_version
+from common.updater_qt import UpdateController
 from host import HostServer, detect_display
 
 log = logging.getLogger("host_gui")
@@ -165,7 +167,7 @@ class MainWindow(QMainWindow):
         self.args = args
         self.server_thread: ServerThread | None = None
         self.tray_manager: TrayManager | None = None
-        self.setWindowTitle("Remote Desktop Host")
+        self.setWindowTitle(f"Remote Desktop Host v{current_version()}")
         self.resize(600, 450)
 
         # Clipboard state
@@ -218,12 +220,17 @@ class MainWindow(QMainWindow):
         self.start_stop_btn = QPushButton("Bắt đầu")
         self.start_stop_btn.clicked.connect(self._toggle_server)
         btn_row.addWidget(self.start_stop_btn)
+        self.update_btn = QPushButton("Cập nhật")
+        self.update_btn.clicked.connect(self._check_update)
+        btn_row.addWidget(self.update_btn)
         self.quit_btn = QPushButton("Thoát")
         self.quit_btn.setStyleSheet("color: red;")
         self.quit_btn.clicked.connect(self._quit_app)
         btn_row.addWidget(self.quit_btn)
         status_layout.addLayout(btn_row)
         layout.addWidget(status_group)
+
+        self.updater = UpdateController(self, "host-gui")
 
         # Log
         log_group = QGroupBox("Log")
@@ -262,6 +269,9 @@ class MainWindow(QMainWindow):
             self._start_server()
         else:
             self._stop_server()
+
+    def _check_update(self) -> None:
+        self.updater.start()
 
     def _start_server(self) -> None:
         self.args.token = self.token_edit.text()

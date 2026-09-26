@@ -198,6 +198,20 @@ Lưu ý khi dùng bản đóng gói:
 - Log ghi cạnh file thực thi: `<thư mục app>/logs/{host,client}.log`.
 - File Windows chưa ký số nên SmartScreen có thể cảnh báo — chọn
   *More info → Run anyway*.
+- Build ghi `version.txt` cạnh exe để updater biết version hiện tại.
+
+### Tự cập nhật trong app
+
+Client và host GUI có nút **Cập nhật**: gọi GitHub Releases API (repo public,
+không cần token), so version với bản đang chạy, tải asset đúng OS/arch rồi:
+
+- **Bản đóng gói**: sinh script tách rời, chờ app thoát → thay thư mục
+  (giữ `logs/`) → tự mở lại.
+- **Bản chạy source**: `git pull --ff-only` + `pip install -r requirements.txt`
+  rồi khởi động lại.
+
+Version hiện tại hiện trên tiêu đề cửa sổ. Bản `≤ v0.1.3` chưa có nút này —
+cần cài tay một lần, sau đó update trong app.
 
 ---
 

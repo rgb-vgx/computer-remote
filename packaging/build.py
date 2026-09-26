@@ -47,6 +47,11 @@ HIDDEN_LINUX = [
     "mss.linux.xlib",
     "mss.linux.xgetimage",
     "mss.linux.xshmgetimage",
+    "Xlib",
+    "Xlib.display",
+    "Xlib.display.event",
+    "Xlib.ext.xtest",
+    "Xlib.protocol.event",
 ]
 HIDDEN_WINDOWS = [
     "pynput.keyboard._win32",
@@ -211,6 +216,8 @@ def main() -> int:
             continue
         app_dir = build_target(target)
         print(f"  {app_dir.relative_to(ROOT)}: {human(dir_size(app_dir))}")
+        # Updater đọc file này cạnh exe để biết version hiện tại.
+        (app_dir / "version.txt").write_text(version + "\n", encoding="utf-8")
         if not args.no_archive:
             archives.append(archive_target(target, version))
 
