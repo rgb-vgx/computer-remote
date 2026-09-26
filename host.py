@@ -10,7 +10,6 @@ Chạy:
 from __future__ import annotations
 
 import argparse
-import fcntl
 import logging
 import os
 import queue
@@ -36,7 +35,12 @@ log = logging.getLogger("host")
 # ---------------------------------------------------------------------------
 
 class H264Encoder:
-    """Encode raw BGR frames to H.264 via ffmpeg subprocess."""
+    """Encode raw BGRA frames to H.264 via ffmpeg subprocess.
+
+    Output được drain bằng 1 reader thread riêng: x264/ffmpeg có thể trả
+    output trễ hơn thời điểm ``encode()`` được gọi, đọc ngay sau khi ghi sẽ
+    hụt frame (nhất là màn hình tĩnh, P-frame rất nhỏ nằm lâu trong buffer).
+    """
 
     def __init__(self, width: int, height: int, fps: int,
                  quality: int = 85) -> None:
@@ -48,7 +52,7 @@ class H264Encoder:
         self._proc = sp.Popen(
             ['ffmpeg',
              '-f', 'rawvideo',
-             '-pix_fmt', 'bgr24',
+             '-pix_fmt', 'bgra',
              '-s', f'{width}x{height}',
              '-r', str(max(1, fps)),
              '-i', '-',
@@ -58,39 +62,68 @@ class H264Encoder:
              '-crf', str(crf),
              '-pix_fmt', 'yuv420p',
              '-g', '30',
+             '-flush_packets', '1',
              '-f', 'h264',
              '-'],
             stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.DEVNULL,
             bufsize=1024**2)
 
-        # Non-blocking stdout read.
+        self._out = bytearray()
+        self._out_lock = threading.Lock()
+        self._closed = False
+
+        os.set_blocking(self._proc.stdout.fileno(), False)
+        self._reader = threading.Thread(
+            target=self._reader_loop, name="h264-enc-out", daemon=True)
+        self._reader.start()
+
+    def _reader_loop(self) -> None:
         fd = self._proc.stdout.fileno()
-        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-
-    def encode(self, frame: np.ndarray) -> bytes:
-        """Encode one BGR frame, return H.264 Annex B data."""
-        self._proc.stdin.write(frame.tobytes())
-        self._proc.stdin.flush()
-
-        chunks = []
-        while True:
+        while not self._closed and self._proc.poll() is None:
             try:
-                chunk = os.read(self._proc.stdout.fileno(), 131072)
+                chunk = os.read(fd, 262144)
                 if not chunk:
                     break
-                chunks.append(chunk)
+                with self._out_lock:
+                    self._out += chunk
             except BlockingIOError:
+                time.sleep(0.002)
+            except OSError:
                 break
-        return b''.join(chunks)
+
+    def encode(self, frame: np.ndarray) -> bytes:
+        """Encode one BGRA frame, return H.264 Annex B data.
+
+        Ghi thẳng buffer của numpy vào pipe, không copy qua ``tobytes()``.
+        """
+        self._proc.stdin.write(np.ascontiguousarray(frame).data)
+        self._proc.stdin.flush()
+
+        # Chờ ngắn cho access unit hiện tại kịp ra; thường đã có sẵn vì
+        # reader thread drain song song trong lúc chờ frame budget.
+        deadline = time.time() + 0.1
+        while time.time() < deadline:
+            with self._out_lock:
+                if self._out:
+                    break
+            time.sleep(0.002)
+        return self.take_output()
+
+    def take_output(self) -> bytes:
+        with self._out_lock:
+            data = bytes(self._out)
+            self._out.clear()
+        return data
 
     def close(self) -> None:
+        self._closed = True
         try:
             self._proc.stdin.close()
             self._proc.terminate()
             self._proc.wait(timeout=2)
         except Exception:
             self._proc.kill()
+        self._reader.join(timeout=1.0)
 
     @staticmethod
     def available() -> bool:
@@ -343,9 +376,9 @@ class HostServer:
                 monitor = sct.monitors[1]
 
                 # First capture to get dimensions
-                raw = sct.grab(monitor)
-                img = np.asarray(raw)[:, :, :3]
-                cap_h, cap_w = img.shape[:2]
+                shot = sct.grab(monitor)
+                first = np.asarray(shot)
+                cap_h, cap_w = first.shape[:2]
                 if cap_w > self.args.max_width:
                     scale = self.args.max_width / cap_w
                     frame_w, frame_h = self.args.max_width, int(cap_h * scale)
@@ -353,6 +386,9 @@ class HostServer:
                     frame_w, frame_h = cap_w, cap_h
 
                 if use_h264:
+                    # yuv420p (libx264) yêu cầu kích thước chẵn.
+                    frame_w -= frame_w % 2
+                    frame_h -= frame_h % 2
                     h264_enc = H264Encoder(frame_w, frame_h, self.args.fps,
                                            self.args.quality)
                     protocol.send_json(
@@ -362,8 +398,12 @@ class HostServer:
 
                 skip_until = 0.0
                 prev_frame: np.ndarray | None = None
+                last_jpeg = b""
+                sent_w = sent_h = 0
                 last_send = time.time()
-                heartbeat_interval = 1.0  # gửi ít nhất 1 frame/s
+                # H.264: decoder giữ 1-2 frame (parser + libavcodec), P-frame
+                # rất nhỏ nên heartbeat dày hơn để không lag khi màn hình tĩnh.
+                heartbeat_interval = 0.25 if use_h264 else 1.0
                 frame_ms_total = 0.0
                 frame_ms_count = 0
 
@@ -374,22 +414,17 @@ class HostServer:
                         continue
 
                     t0 = now
-                    raw = sct.grab(monitor)
-                    img = np.ascontiguousarray(np.asarray(raw)[:, :, :3])
-                    if img.shape[1] > self.args.max_width:
-                        scale = self.args.max_width / img.shape[1]
-                        img = cv2.resize(
-                            img, (self.args.max_width,
-                                  int(img.shape[0] * scale)),
-                            interpolation=cv2.INTER_AREA)
+                    shot = sct.grab(monitor)
+                    # View BGRA trên buffer của mss — không copy.
+                    frame = np.asarray(shot)
 
                     # Differential update: màn hình tĩnh cho frame giống hệt
                     # nhau nên chỉ cần so khớp chính xác — bắt được cả thay
                     # đổi nhỏ (con trỏ soạn thảo, text) mà ngưỡng MSE bỏ sót.
                     changed = (prev_frame is None
-                               or img.shape != prev_frame.shape
-                               or not np.array_equal(img, prev_frame))
-                    prev_frame = img
+                               or frame.shape != prev_frame.shape
+                               or not np.array_equal(frame, prev_frame))
+                    prev_frame = frame
 
                     if not changed and (now - last_send) < heartbeat_interval:
                         # Chưa đủ thay đổi, chưa đến hạn heartbeat
@@ -400,23 +435,36 @@ class HostServer:
                             skip_until = now + frame_budget
                         continue
 
-                    if not changed:
-                        # Đến hạn heartbeat, gửi frame hiện tại
-                        pass
-
                     if use_h264 and h264_enc:
-                        data = h264_enc.encode(img)
+                        if frame.shape[1] != frame_w or frame.shape[0] != frame_h:
+                            frame = cv2.resize(
+                                frame, (frame_w, frame_h),
+                                interpolation=cv2.INTER_AREA)
+                        data = h264_enc.encode(frame)
                         if data:
                             protocol.send_packet(
                                 sock, protocol.PKT_FRAME_H264, data)
+                        sent_w, sent_h = frame_w, frame_h
                     else:
-                        ok, buf = cv2.imencode(".jpg", img, encode_params)
-                        if not ok:
-                            log.error("cv2.imencode thất bại")
-                            skip_until = now + frame_budget
-                            continue
+                        # Không thay đổi (heartbeat) thì gửi lại JPEG đã encode,
+                        # khỏi cvtColor + imencode lại.
+                        if changed or not last_jpeg:
+                            img = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                            if img.shape[1] > self.args.max_width:
+                                scale = self.args.max_width / img.shape[1]
+                                img = cv2.resize(
+                                    img, (self.args.max_width,
+                                          int(img.shape[0] * scale)),
+                                    interpolation=cv2.INTER_AREA)
+                            ok, buf = cv2.imencode(".jpg", img, encode_params)
+                            if not ok:
+                                log.error("cv2.imencode thất bại")
+                                skip_until = now + frame_budget
+                                continue
+                            last_jpeg = buf.tobytes()
+                            sent_w, sent_h = img.shape[1], img.shape[0]
                         protocol.send_packet(
-                            sock, protocol.PKT_FRAME, buf.tobytes())
+                            sock, protocol.PKT_FRAME, last_jpeg)
 
                     last_send = time.time()
                     frame_ms_total += (last_send - t0) * 1000.0
@@ -429,10 +477,10 @@ class HostServer:
                         skipped = max(0, int(1.0 / max(0.001, frame_budget) - fps))
                         if use_h264:
                             log.info("Stream ~%.1f FPS (H.264 %dx%d, skip ~%d, %.0f ms/frame)",
-                                     fps, frame_w, frame_h, skipped, avg_ms)
+                                     fps, sent_w, sent_h, skipped, avg_ms)
                         else:
                             log.info("Stream ~%.1f FPS (JPEG %dx%d, q=%d, skip ~%d, %.0f ms/frame)",
-                                     fps, img.shape[1], img.shape[0],
+                                     fps, sent_w, sent_h,
                                      self.args.quality, skipped, avg_ms)
                         frames_since_log = 0
                         frame_ms_total = 0.0

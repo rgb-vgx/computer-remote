@@ -150,7 +150,8 @@ echo $DISPLAY                 # không được rỗng (vd ':0')
   kích thước màn hình thật → resize cửa sổ client vẫn click đúng chỗ.
 - **Chỉ gửi frame khi có thay đổi**: host so khớp pixel chính xác với frame
   trước (màn hình tĩnh cho frame giống hệt nhau) → không tốn băng thông, vẫn
-  bắt được thay đổi nhỏ như con trỏ soạn thảo; heartbeat 1 frame/s khi tĩnh.
+  bắt được thay đổi nhỏ như con trỏ soạn thảo; heartbeat khi tĩnh 1 frame/s
+  với JPEG, 4 frame/s với H.264 (bù delay 1–2 frame của decoder).
 - **Threading**: host có 2 thread (capture/send, receive/control) cho mỗi client;
   client để toàn bộ socket trong 1 QThread, GUI thread chỉ chạm UI qua Qt signal.
 

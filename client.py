@@ -45,17 +45,25 @@ class H264Decoder:
         self.width = width
         self.height = height
         self.frame_size = width * height * 3
-        self._buf = b''
+        self._buf = bytearray()
         self._lock = threading.Lock()
         self._closed = False
 
         self._proc = sp.Popen(
             ['ffmpeg',
+             # Input pipe live: mặc định demuxer chờ đủ probesize/analyzeduration
+             # mới phát frame đầu — hạ xuống 0 để decode ngay. KHÔNG dùng
+             # -fflags nobuffer: nó drop packet khi bắt kịp stream.
+             # -threads 1 để decoder không giữ frame theo frame-threading
+             # (stream ngắn/tĩnh sẽ bị delay hoặc không ra frame).
+             '-threads', '1',
+             '-flags', 'low_delay',
+             '-analyzeduration', '0',
+             '-probesize', '32',
              '-f', 'h264',
              '-i', '-',
              '-f', 'rawvideo',
              '-pix_fmt', 'bgr24',
-             '-flags', 'low_delay',
              '-'],
             stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.DEVNULL,
             bufsize=1024**2)
@@ -97,8 +105,10 @@ class H264Decoder:
     def read_frame(self) -> np.ndarray | None:
         with self._lock:
             if len(self._buf) >= self.frame_size:
-                raw = self._buf[:self.frame_size]
-                self._buf = self._buf[self.frame_size:]
+                # Copy 1 frame ra bytes trước khi xoá prefix: numpy giữ
+                # memoryview vào _buf nên không thể resize khi view còn sống.
+                raw = bytes(self._buf[:self.frame_size])
+                del self._buf[:self.frame_size]
                 return np.frombuffer(raw, dtype=np.uint8).reshape(
                     self.height, self.width, 3)
         return None
@@ -395,7 +405,7 @@ class RemoteView(QLabel):
             return
         area = self.size()
         scaled = self._pixmap.scaled(
-            area, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            area, Qt.KeepAspectRatio, Qt.FastTransformation)
         x = (area.width() - scaled.width()) // 2
         y = (area.height() - scaled.height()) // 2
         self._draw_rect = (x, y, scaled.width(), scaled.height())
