@@ -143,6 +143,109 @@ class H264Encoder:
 
 
 # ---------------------------------------------------------------------------
+# Keyboard injection (XSendEvent)
+# ---------------------------------------------------------------------------
+
+# Tên phím (theo pynput, client gửi "Key.<name>") → X keysym.
+_KEY_NAME_TO_KEYSYM = {
+    "shift": 0xFFE1, "ctrl": 0xFFE3, "alt": 0xFFE9, "cmd": 0xFFEB,
+    "alt_gr": 0xFE03, "caps_lock": 0xFFE5,
+    "enter": 0xFF0D, "return": 0xFF0D, "tab": 0xFF09,
+    "backspace": 0xFF08, "esc": 0xFF1B, "escape": 0xFF1B,
+    "delete": 0xFFFF, "home": 0xFF50, "end": 0xFF57,
+    "page_up": 0xFF55, "page_down": 0xFF56, "insert": 0xFF63,
+    "menu": 0xFF67, "pause": 0xFF13, "print_screen": 0xFF61,
+    "left": 0xFF51, "up": 0xFF52, "right": 0xFF53, "down": 0xFF54,
+    "space": 0x0020,
+}
+for _i in range(1, 13):
+    _KEY_NAME_TO_KEYSYM[f"f{_i}"] = 0xFFBE + _i - 1
+
+# Keysym của phím modifier → bit trong event.state.
+_MOD_KEYSYM_TO_MASK = {
+    0xFFE1: 0x01, 0xFFE2: 0x01,   # Shift
+    0xFFE3: 0x04, 0xFFE4: 0x04,   # Control
+    0xFFE9: 0x08, 0xFFEA: 0x08,   # Alt (Mod1)
+    0xFFEB: 0x40, 0xFFEC: 0x40,   # Super (Mod4)
+    0xFE03: 0x80,                 # ISO_Level3_Shift (Mod5/AltGr)
+}
+
+
+class X11Keyboard:
+    """Inject bàn phím bằng XSendEvent.
+
+    pynput dùng XTEST cho phím đặc biệt, nhưng event XTEST không tới được
+    app trên setup này (Qt bỏ qua), trong khi XSendEvent tới đều. Modifier
+    (shift/ctrl/alt/cmd/alt_gr) phải track thủ công vì XSendEvent không
+    cập nhật state của X server.
+    """
+
+    def __init__(self) -> None:
+        from Xlib import display
+        self._display = display.Display()
+        self._lock = threading.Lock()
+        self._mods = 0
+
+    def press(self, key: str) -> None:
+        with self._lock:
+            self._inject(key, is_press=True)
+
+    def release(self, key: str) -> None:
+        with self._lock:
+            self._inject(key, is_press=False)
+
+    def _keysym(self, key: str) -> int | None:
+        name = key[4:] if key.startswith("Key.") else key
+        if name in _KEY_NAME_TO_KEYSYM:
+            return _KEY_NAME_TO_KEYSYM[name]
+        if len(name) == 1:
+            return ord(name)
+        return None
+
+    def _state_for(self, keysym: int) -> int:
+        """Mask Shift/AltGr cần thiết để gõ ra keysym này."""
+        keycode = self._display.keysym_to_keycode(keysym)
+        if not keycode:
+            return 0
+        for index, mask in ((1, 0x01), (2, 0x80), (3, 0x81)):
+            if self._display.keycode_to_keysym(keycode, index) == keysym:
+                return mask
+        return 0
+
+    def _inject(self, key: str, is_press: bool) -> None:
+        from Xlib import X
+        from Xlib.display import event as xevent
+
+        keysym = self._keysym(key)
+        if keysym is None:
+            log.warning("Unknown special key: %s", key)
+            return
+        keycode = self._display.keysym_to_keycode(keysym)
+        if not keycode:
+            log.warning("Không map được phím %r trên layout hiện tại", key)
+            return
+
+        is_mod = keysym in _MOD_KEYSYM_TO_MASK
+        state = self._mods if is_mod else self._mods | self._state_for(keysym)
+        focus = self._display.get_input_focus().focus
+        event = (xevent.KeyPress if is_press else xevent.KeyRelease)(
+            detail=keycode, state=state, time=0,
+            root=self._display.screen().root, window=focus,
+            same_screen=0, child=X.NONE,
+            root_x=0, root_y=0, event_x=0, event_y=0)
+        if hasattr(focus, "send_event"):
+            focus.send_event(event)
+        else:
+            self._display.send_event(focus, event)
+        self._display.sync()
+
+        if is_mod:
+            mask = _MOD_KEYSYM_TO_MASK[keysym]
+            self._mods = ((self._mods | mask) if is_press
+                          else (self._mods & ~mask))
+
+
+# ---------------------------------------------------------------------------
 # Clipboard helpers
 # ---------------------------------------------------------------------------
 
@@ -531,7 +634,10 @@ class HostServer:
                     event = protocol.decode_json(payload)
                 except Exception:
                     continue
-                self._apply_event(event)
+                try:
+                    self._apply_event(event)
+                except Exception as exc:
+                    log.warning("Bỏ qua control event lỗi: %s", exc)
         except (ConnectionError, OSError, struct.error) as exc:
             log.info("Control loop dừng: %s", exc)
         except Exception as exc:
@@ -613,27 +719,18 @@ class HostServer:
         kbd = self._get_keyboard()
         if kbd is None:
             return
-        from pynput.keyboard import Key
         kind = event.get("event")
         key_str = event.get("key", "")
         if not key_str:
             return
-        if key_str.startswith("Key."):
-            name = key_str[4:]
-            try:
-                key = getattr(Key, name)
-            except AttributeError:
-                log.warning("Unknown special key: %s", name)
-                return
-        else:
-            key = key_str
+        log.debug("Inject key: %s %r", kind, key_str)
         try:
             if kind == "key_down":
-                kbd.press(key)
+                kbd.press(key_str)
             else:
-                kbd.release(key)
+                kbd.release(key_str)
         except Exception as exc:
-            log.debug("Keyboard inject error: %s", exc)
+            log.warning("Keyboard inject error (%s): %s", key_str, exc)
 
     def _apply_clipboard(self, event: dict) -> None:
         text = event.get("text", "")
@@ -660,8 +757,7 @@ class HostServer:
     def _get_keyboard(self):
         if self._keyboard is None:
             try:
-                from pynput.keyboard import Controller
-                self._keyboard = Controller()
+                self._keyboard = X11Keyboard()
             except Exception as exc:
                 log.error("Không khởi tạo được keyboard: %s", exc)
                 self._keyboard = False

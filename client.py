@@ -159,8 +159,10 @@ def _qt_key_to_key_str(qt_key: int, text: str) -> str | None:
         return f"Key.{name}"
     if text and text.isprintable():
         return text
-    if qt_key == 0x20:
-        return " "
+    if 0x21 <= qt_key <= 0x7E:
+        # Tổ hợp Ctrl/Alt: Qt không cho text printable, dùng ký tự gốc
+        # (vd Ctrl+C → "c"); modifier được gửi riêng qua Key.ctrl.
+        return chr(qt_key).lower()
     return None
 
 
@@ -438,6 +440,7 @@ class RemoteView(QLabel):
                 {"event": "mouse_move", "x": coord[0], "y": coord[1]})
 
     def mousePressEvent(self, event) -> None:
+        self.setFocus()
         coord = self._normalized(event.position())
         btn = self._button_name(event.button())
         if coord and btn:
@@ -567,6 +570,7 @@ class MainWindow(QMainWindow):
         self.connect_btn.setText("Disconnect")
         self._set_form_enabled(False)
         self.status_label.setText("Trạng thái: Connecting...")
+        self.view.setFocus()  # để phím đi vào RemoteView ngay từ đầu
 
         self._last_clipboard = ""
         self._clipboard_skip = 0
@@ -596,6 +600,7 @@ class MainWindow(QMainWindow):
             self.worker.send_control(event)
 
     def _on_key_event(self, event: dict) -> None:
+        log.debug("Key → host: %s %s", event.get("event"), event.get("key"))
         if self.worker is not None:
             self.worker.send_control(event)
 

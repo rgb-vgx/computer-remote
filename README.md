@@ -205,9 +205,11 @@ Lưu ý khi dùng bản đóng gói:
 
 - Chỉ **1 client** tại một thời điểm.
 - Chỉ **X11** (không Wayland — cố ý không bypass quyền OS).
-- Codec **JPEG từng frame** (motion JPEG): tốn băng thông, không nén theo thời gian.
-- Chỉ **mouse** (move / left / right). **Chưa có keyboard.**
-- Không clipboard, không multi-monitor, không audio, không file transfer.
+- Codec **JPEG từng frame** mặc định (H.264 cần ffmpeg, giảm băng thông
+  nhưng thêm 1–2 frame delay do decode).
+- Chỉ **mouse** (move / click trái, phải / scroll) và **keyboard** (ký tự,
+  phím đặc biệt, modifier). Chưa hỗ trợ dead-key / IME phức tạp.
+- Clipboard chỉ text; không multi-monitor, không audio, không file transfer.
 - Không tự reconnect; mất kết nối thì bấm Connect lại.
 - Token đơn giản, không TLS tầng ứng dụng (dựa vào Tailscale).
 
@@ -215,11 +217,11 @@ Lưu ý khi dùng bản đóng gói:
 
 ## 11. Roadmap nâng cấp
 
-1. **Video codec**: thay JPEG bằng **H.264 / VP8** (nén theo thời gian → ít băng thông, mượt hơn).
-2. **Keyboard**: gửi key press khi cửa sổ client focus (kèm cảnh báo rủi ro rõ ràng).
-3. **Clipboard** đồng bộ 2 chiều.
-4. **Multi-monitor**: chọn / chuyển màn hình.
-5. **Reconnect** tự động khi rớt mạng.
-6. **Auth tốt hơn**: challenge-response, key trao đổi, rate-limit.
-7. **Transport**: QUIC / WebRTC (NAT traversal, độ trễ thấp).
-8. **Port C++/Qt** sau khi bản Python chạy ổn định (hiệu năng capture/encode).
+1. **Video codec**: encode/decode trong process (PyAV) hoặc hardware
+   (VAAPI/NVENC) để giảm latency và CPU.
+2. **Clipboard ảnh/file**, dead-key / IME.
+3. **Multi-monitor**: chọn / chuyển màn hình.
+4. **Reconnect** tự động khi rớt mạng.
+5. **Auth tốt hơn**: challenge-response, key trao đổi, rate-limit.
+6. **Transport**: QUIC / WebRTC (NAT traversal, độ trễ thấp).
+7. **Port C++/Qt** sau khi bản Python chạy ổn định (hiệu năng capture/encode).
