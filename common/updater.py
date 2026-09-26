@@ -308,9 +308,9 @@ echo "$(date '+%F %T') swapped, starting {exe}" >> "{dst}/logs/update.log"
 exec "{exe}"
 """
 
-# Windows: nhúng sẵn đường dẫn + PID (không truyền tham số), gọi thẳng binary
-# trong System32 để tránh `find`/`tasklist` bị PATH hijack, và ghi log để dễ
-# chẩn đoán nếu update thất bại.
+# Windows: nhúng sẵn đường dẫn + PID (không truyền tham số), chờ app thoát
+# bằng PowerShell Wait-Process (fallback ping nếu thiếu powershell), gọi
+# thẳng binary trong System32 và ghi log để dễ chẩn đoán.
 _WIN_SCRIPT = """@echo off
 setlocal
 set "SRC={src}"
@@ -319,22 +319,17 @@ set "EXE={exe}"
 set "LOG={log}"
 set "PID={pid}"
 set "SYS=%SystemRoot%\\System32"
+set "PS=%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
 echo [%date% %time%] update start pid=%PID% > "%LOG%"
 echo [%date% %time%] src="%SRC%" dst="%DST%" >> "%LOG%"
-set /a N=0
-:wait
-"%SYS%\\tasklist.exe" /fi "pid eq %PID%" 2>nul | "%SYS%\\find.exe" /i "%EXE%" >nul
-if errorlevel 1 goto ready
-set /a N+=1
-if %N% geq 150 (
-  echo [%date% %time%] timeout - app chua thoat >> "%LOG%"
-  exit /b 1
+if exist "%PS%" (
+  "%PS%" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Wait-Process -Id %PID% -Timeout 240 -ErrorAction SilentlyContinue"
+  echo [%date% %time%] waited via powershell >> "%LOG%"
+) else (
+  "%SYS%\\ping.exe" -n 5 127.0.0.1 >nul
+  echo [%date% %time%] waited via ping fallback >> "%LOG%"
 )
-"%SYS%\\ping.exe" -n 2 127.0.0.1 >nul
-goto wait
-:ready
-echo [%date% %time%] app exited >> "%LOG%"
-"%SYS%\\robocopy.exe" "%SRC%" "%DST%" /E /R:3 /W:1 /NFL /NDL /NP >> "%LOG%" 2>&1
+"%SYS%\\robocopy.exe" "%SRC%" "%DST%" /E /R:10 /W:1 /NFL /NDL /NP >> "%LOG%" 2>&1
 echo [%date% %time%] robocopy rc=%ERRORLEVEL% >> "%LOG%"
 start "" "%DST%\\%EXE%"
 echo [%date% %time%] started "%DST%\\%EXE%" >> "%LOG%"
