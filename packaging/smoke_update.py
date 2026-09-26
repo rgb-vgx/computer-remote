@@ -90,14 +90,31 @@ def main() -> int:
             if version == "9.9.9":
                 break
             time.sleep(0.5)
-        assert version == "9.9.9", f"version chưa đổi: {version!r}"
-        assert (app_dir / "_internal" / "new.txt").exists(), "thiếu file mới"
-        assert (app_dir / "logs" / "host.log").read_text(encoding="utf-8") == "log cu", \
-            "mất log cũ"
-        update_log = (app_dir / "logs" / "update.log").read_text(
-            encoding="utf-8", errors="replace")
-        assert "robocopy rc=" in update_log or "swapped" in update_log, update_log
-        assert "timeout" not in update_log, update_log
+        try:
+            assert version == "9.9.9", f"version chưa đổi: {version!r}"
+            assert (app_dir / "_internal" / "new.txt").exists(), "thiếu file mới"
+            assert (app_dir / "logs" / "host.log").read_text(
+                encoding="utf-8") == "log cu", "mất log cũ"
+            update_log = (app_dir / "logs" / "update.log").read_text(
+                encoding="utf-8", errors="replace")
+            assert "robocopy rc=" in update_log or "swapped" in update_log, update_log
+            assert "timeout" not in update_log, update_log
+        except AssertionError:
+            print("--- CHẨN ĐOÁN ---")
+            print("app dir:", sorted(str(p.relative_to(app_dir))
+                                     for p in app_dir.rglob("*")))
+            work = tmp / "work"
+            print("work dir:", sorted(str(p.relative_to(work))
+                                      for p in work.rglob("*"))
+                  if work.exists() else "không có")
+            for bat in list(work.glob("remote-update.*")) if work.exists() else []:
+                print(f"--- nội dung {bat.name} ---")
+                print(bat.read_text(encoding="utf-8", errors="replace"))
+            log_file = app_dir / "logs" / "update.log"
+            print("--- update.log (tồn tại:", log_file.exists(), ") ---")
+            if log_file.exists():
+                print(log_file.read_text(encoding="utf-8", errors="replace"))
+            raise
         if sys.platform != "win32":
             started = app_dir / "STARTED-NEW"
             deadline = time.time() + 10
