@@ -218,3 +218,86 @@ def test_pynput_keyboard_unicode_send_fail(monkeypatch):
     kbd.press("ế")      # Unicode gửi thất bại → cảnh báo, không crash
     kbd.release("ế")
     assert calls == [("release", "ế")]
+
+
+class FakeMSS:
+    def __init__(self, monitors):
+        self.monitors = monitors
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+MONITORS = [
+    {"left": 0, "top": 0, "width": 3840, "height": 1080},
+    {"left": 0, "top": 0, "width": 1920, "height": 1080},
+    {"left": 1920, "top": 0, "width": 1280, "height": 720},
+]
+
+
+def _fake_mss(monkeypatch, monitors=MONITORS):
+    monkeypatch.setattr(host.mss, "MSS", lambda: FakeMSS(monitors))
+
+
+def test_list_monitors(monkeypatch):
+    _fake_mss(monkeypatch)
+    monitors = host.list_monitors()
+    assert [m["index"] for m in monitors] == [1, 2]
+    assert monitors[0]["primary"] is True
+    assert monitors[1]["primary"] is False
+    assert monitors[1]["left"] == 1920
+
+
+def test_apply_monitor(monkeypatch):
+    server = make_server()
+    server._apply_monitor({"index": 2})
+    assert server._monitor_index == 2
+    server._apply_monitor({"index": "sai"})
+    assert server._monitor_index == 2
+    server._apply_monitor({"index": 0})   # clamp về 1
+    assert server._monitor_index == 1
+
+
+def test_monitor_rect_selected_monitor(monkeypatch):
+    _fake_mss(monkeypatch)
+    server = make_server()
+    server._monitor_index = 2
+    assert server._monitor_rect() == (1920, 0, 1280, 720)
+    server._monitor_index = 1
+    assert server._monitor_rect() == (0, 0, 1920, 1080)
+
+
+def test_mouse_mapping_uses_monitor_offset(monkeypatch):
+    server = make_server()
+    positions = []
+
+    class FakeMouse:
+        @property
+        def position(self):
+            return None
+
+        @position.setter
+        def position(self, value):
+            positions.append(value)
+
+    # pynput.mouse cần X connection khi import trên Linux → thay bằng fake.
+    fake_mouse = types.ModuleType("pynput.mouse")
+
+    class Button:
+        left = "L"
+        right = "R"
+
+    fake_mouse.Button = Button
+    fake_pkg = types.ModuleType("pynput")
+    fake_pkg.mouse = fake_mouse
+    monkeypatch.setitem(sys.modules, "pynput", fake_pkg)
+    monkeypatch.setitem(sys.modules, "pynput.mouse", fake_mouse)
+
+    monkeypatch.setattr(server, "_get_mouse", lambda: FakeMouse())
+    monkeypatch.setattr(server, "_monitor_rect",
+                        lambda: (1920, 0, 1280, 720))
+    server._apply_mouse({"event": "mouse_move", "x": 0.5, "y": 0.5})
+    assert positions[-1] == (1920 + 640, 360)

@@ -557,6 +557,27 @@ def check_display_env() -> None:
 # Host server
 # ---------------------------------------------------------------------------
 
+def list_monitors() -> list[dict]:
+    """Danh sách màn hình (mss index ≥ 1; bỏ index 0 = toàn bộ desktop)."""
+    result: list[dict] = []
+    try:
+        with mss.MSS() as sct:
+            for index, mon in enumerate(sct.monitors):
+                if index == 0:
+                    continue
+                result.append({
+                    "index": index,
+                    "width": mon["width"],
+                    "height": mon["height"],
+                    "left": mon["left"],
+                    "top": mon["top"],
+                    "primary": index == 1,
+                })
+    except Exception as exc:
+        log.debug("Không liệt kê được monitors: %s", exc)
+    return result
+
+
 class HostServer:
     """TCP server stream màn hình + nhận control."""
 
@@ -570,6 +591,10 @@ class HostServer:
         self._view_only_logged = False
         # Client có thể đổi max-width khi đang stream (set_resolution).
         self._max_width = self._clamp_width(args.max_width)
+        # Multi-monitor: mss index (≥ 1); client có thể đổi (set_monitor).
+        self._monitor_index = 1
+        self._monitor_rect_cache: tuple[int, int, int, int] | None = None
+        self._monitor_rect_index: int | None = None
 
         # Clipboard
         self._clipboard_send_queue: queue.Queue[str] = queue.Queue()
@@ -708,6 +733,13 @@ class HostServer:
             return
         protocol.send_json(sock, protocol.PKT_INFO,
                            {"type": "info", "message": "auth ok"})
+        try:
+            protocol.send_json(sock, protocol.PKT_INFO,
+                               {"type": "monitors",
+                                "monitors": list_monitors(),
+                                "current": self._monitor_index})
+        except OSError:
+            return
 
         # Codec negotiation: client's supported codecs
         client_codecs = hello.get("codecs", ["jpeg"])
@@ -755,7 +787,9 @@ class HostServer:
 
         try:
             with mss.MSS() as sct:
-                monitor = sct.monitors[1]
+                active_monitor = self._clamp_monitor(sct, self._monitor_index)
+                self._monitor_index = active_monitor
+                monitor = sct.monitors[active_monitor]
 
                 # First capture to get dimensions
                 shot = sct.grab(monitor)
@@ -802,8 +836,19 @@ class HostServer:
                     # View BGRA trên buffer của mss — không copy.
                     frame = np.asarray(shot)
 
-                    # Client đổi độ phân giải giữa chừng?
-                    if self._max_width != active_max_width:
+                    # Client đổi monitor / độ phân giải giữa chừng?
+                    if (self._monitor_index != active_monitor
+                            or self._max_width != active_max_width):
+                        if self._monitor_index != active_monitor:
+                            active_monitor = self._clamp_monitor(
+                                sct, self._monitor_index)
+                            self._monitor_index = active_monitor
+                            monitor = sct.monitors[active_monitor]
+                            frame = np.asarray(sct.grab(monitor))
+                            prev_frame = None
+                            log.info("Đổi monitor: #%d (%dx%d)",
+                                     active_monitor, frame.shape[1],
+                                     frame.shape[0])
                         active_max_width = self._max_width
                         cap_w, cap_h = frame.shape[1], frame.shape[0]
                         if cap_w > active_max_width:
@@ -826,8 +871,9 @@ class HostServer:
                                  "width": frame_w, "height": frame_h})
                         last_jpeg = b""
                         force_send = True
-                        log.info("Đổi độ phân giải: max-width=%d → %dx%d",
-                                 active_max_width, frame_w, frame_h)
+                        log.info("Cấu hình stream: monitor #%d, max-width=%d → %dx%d",
+                                 active_monitor, active_max_width,
+                                 frame_w, frame_h)
 
                     # Differential update: màn hình tĩnh cho frame giống hệt
                     # nhau nên chỉ cần so khớp chính xác — bắt được cả thay
@@ -994,6 +1040,18 @@ class HostServer:
             self._apply_clipboard(event)
         elif kind == "set_resolution":
             self._apply_resolution(event)
+        elif kind == "set_monitor":
+            self._apply_monitor(event)
+
+    def _apply_monitor(self, event: dict) -> None:
+        try:
+            index = int(event.get("index", 1))
+        except (TypeError, ValueError):
+            return
+        index = max(1, index)
+        if index != self._monitor_index:
+            self._monitor_index = index
+            log.info("Client yêu cầu monitor #%d", index)
 
     def _apply_resolution(self, event: dict) -> None:
         value = event.get("max_width")
@@ -1019,15 +1077,15 @@ class HostServer:
         if mouse is None:
             return
         from pynput.mouse import Button
-        screen_w, screen_h = self._screen_size()
+        left, top, screen_w, screen_h = self._monitor_rect()
         kind = event.get("event")
         if kind == "mouse_move":
-            x = _clamp01(event.get("x", 0.0)) * screen_w
-            y = _clamp01(event.get("y", 0.0)) * screen_h
+            x = left + _clamp01(event.get("x", 0.0)) * screen_w
+            y = top + _clamp01(event.get("y", 0.0)) * screen_h
             mouse.position = (int(x), int(y))
         elif kind in ("mouse_down", "mouse_up"):
-            x = _clamp01(event.get("x", 0.0)) * screen_w
-            y = _clamp01(event.get("y", 0.0)) * screen_h
+            x = left + _clamp01(event.get("x", 0.0)) * screen_w
+            y = top + _clamp01(event.get("y", 0.0)) * screen_h
             mouse.position = (int(x), int(y))
             btn = Button.right if event.get("button") == "right" else Button.left
             if kind == "mouse_down":
@@ -1035,8 +1093,8 @@ class HostServer:
             else:
                 mouse.release(btn)
         elif kind == "scroll":
-            x = _clamp01(event.get("x", 0.0)) * screen_w
-            y = _clamp01(event.get("y", 0.0)) * screen_h
+            x = left + _clamp01(event.get("x", 0.0)) * screen_w
+            y = top + _clamp01(event.get("y", 0.0)) * screen_h
             mouse.position = (int(x), int(y))
             dx = _scroll_steps(event.get("dx", 0))
             dy = _scroll_steps(event.get("dy", 0))
@@ -1097,12 +1155,22 @@ class HostServer:
                 self._keyboard = False
         return self._keyboard or None
 
-    def _screen_size(self) -> tuple[int, int]:
-        if not hasattr(self, "_screen_cache"):
+    def _monitor_rect(self) -> tuple[int, int, int, int]:
+        """(left, top, width, height) của monitor đang stream (cached)."""
+        if (self._monitor_rect_cache is None
+                or self._monitor_rect_index != self._monitor_index):
             with mss.MSS() as sct:
-                mon = sct.monitors[1]
-                self._screen_cache = (mon["width"], mon["height"])
-        return self._screen_cache
+                index = self._clamp_monitor(sct, self._monitor_index)
+                mon = sct.monitors[index]
+            self._monitor_rect_cache = (
+                mon["left"], mon["top"], mon["width"], mon["height"])
+            self._monitor_rect_index = self._monitor_index
+        return self._monitor_rect_cache
+
+    @staticmethod
+    def _clamp_monitor(sct, index: int) -> int:
+        count = len(sct.monitors)
+        return max(1, min(int(index), count - 1))
 
 
 # ---------------------------------------------------------------------------

@@ -203,6 +203,7 @@ class NetworkWorker(QThread):
     rejected = Signal(str)   # host từ chối (sai token, bị ngắt) — không retry
     disconnected = Signal(str)
     clipboard_from_host = Signal(str)
+    monitors_ready = Signal(list, int)
 
     def __init__(self, host: str, port: int, token: str) -> None:
         super().__init__()
@@ -327,6 +328,13 @@ class NetworkWorker(QThread):
                                     "event": "codec_request",
                                     "codec": "jpeg",
                                 })
+                    continue
+                elif info.get("type") == "monitors":
+                    self.monitors_ready.emit(
+                        list(info.get("monitors", [])),
+                        int(info.get("current", 1) or 1))
+                    continue
+                if info.get("type") != "info":
                     continue
                 log.info("Kết nối thành công — %s", msg)
                 self.status.emit(f"Đã kết nối — {msg}")
@@ -570,6 +578,14 @@ class MainWindow(QMainWindow):
         self.res_combo.lineEdit().editingFinished.connect(
             self._on_resolution_edited)
 
+        self.monitor_combo = QComboBox()
+        self.monitor_combo.addItem("Theo host", None)
+        self.monitor_combo.setEnabled(False)
+        self.monitor_combo.setToolTip(
+            "Chọn màn hình host để xem/điều khiển.\n"
+            "Host gửi danh sách khi kết nối; 'Theo host' = màn hình chính.")
+        self.monitor_combo.currentIndexChanged.connect(self._on_monitor_changed)
+
         form = QHBoxLayout()
         form.addWidget(QLabel("Host:"))
         form.addWidget(self.host_edit)
@@ -577,6 +593,8 @@ class MainWindow(QMainWindow):
         form.addWidget(self.port_edit)
         form.addWidget(QLabel("Token:"))
         form.addWidget(self.token_edit)
+        form.addWidget(QLabel("Màn hình:"))
+        form.addWidget(self.monitor_combo)
         form.addWidget(QLabel("Độ phân giải:"))
         form.addWidget(self.res_combo)
         form.addWidget(self.connect_btn)
@@ -679,6 +697,34 @@ class MainWindow(QMainWindow):
                 self.res_combo.setEditText(str(width))
         self._send_resolution()
 
+    def _on_monitors_ready(self, monitors: list, current: int) -> None:
+        self.monitor_combo.blockSignals(True)
+        self.monitor_combo.clear()
+        self.monitor_combo.addItem("Theo host", None)
+        for mon in monitors:
+            label = f"#{mon.get('index')}: {mon.get('width')}x{mon.get('height')}"
+            if mon.get("primary"):
+                label += " (chính)"
+            self.monitor_combo.addItem(label, mon.get("index"))
+        self.monitor_combo.setEnabled(len(monitors) > 1)
+        index = self.monitor_combo.findData(current)
+        self.monitor_combo.setCurrentIndex(index if index > 0 else 0)
+        self.monitor_combo.blockSignals(False)
+
+    def _on_monitor_changed(self, index: int) -> None:
+        if self.worker is None:
+            return
+        data = self.monitor_combo.itemData(index)
+        self.worker.send_control({"event": "set_monitor",
+                                  "index": int(data or 1)})
+
+    def _reset_monitor_combo(self) -> None:
+        self.monitor_combo.blockSignals(True)
+        self.monitor_combo.clear()
+        self.monitor_combo.addItem("Theo host", None)
+        self.monitor_combo.setEnabled(False)
+        self.monitor_combo.blockSignals(False)
+
     def _on_frame_ready(self, img) -> None:
         size = f"{img.width()}x{img.height()}"
         if self.size_label.text() != size:
@@ -710,6 +756,7 @@ class MainWindow(QMainWindow):
         self.worker.rejected.connect(self._on_rejected)
         self.worker.disconnected.connect(self._on_disconnected)
         self.worker.clipboard_from_host.connect(self._on_clipboard_from_host)
+        self.worker.monitors_ready.connect(self._on_monitors_ready)
         self.worker.start()
         width = self._selected_width()
         if width is not None:
@@ -771,6 +818,7 @@ class MainWindow(QMainWindow):
         self._teardown_worker()
         self.connect_btn.setText("Connect")
         self._set_form_enabled(True)
+        self._reset_monitor_combo()
         self.view.clear_frame("Disconnected")
         self.size_label.setText("")
         self.status_label.setText(f"Trạng thái: Disconnected ({reason})")

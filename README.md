@@ -255,7 +255,9 @@ cần cài tay một lần, sau đó update trong app.
   host** (tiếng Việt có dấu, CJK...) — inject trực tiếp qua X11 keysym-remap /
   Windows SendInput Unicode. Text do IME/bộ gõ phía **client** commit được gửi
   nguyên ký tự; compose IME ngay trên host vẫn có thể lệch.
-- Clipboard chỉ text; không multi-monitor, không audio, không file transfer.
+- Clipboard chỉ text; không audio, không file transfer.
+- **Multi-monitor**: client chọn màn hình trong combo "Màn hình" (host báo danh
+  sách khi kết nối); toạ độ chuột được map theo đúng monitor đang xem.
 - Token đơn giản (đã so constant-time + khóa IP sau 5 lần sai), không TLS
   tầng ứng dụng (dựa vào Tailscale).
 
@@ -280,8 +282,7 @@ release workflow còn chạy smoke test cài đặt updater trên cả Linux/Win
 1. **Video codec**: encode/decode trong process (PyAV) hoặc hardware
    (VAAPI/NVENC) để giảm latency và CPU.
 2. **Clipboard ảnh/file**.
-3. **Multi-monitor**: chọn / chuyển màn hình.
-4. **Dirty-rectangle/XDamage** + adaptive fps/quality theo băng thông.
-5. **Auth tốt hơn**: challenge-response, key trao đổi (đã có rate-limit).
-6. **Transport**: QUIC / WebRTC (NAT traversal, độ trễ thấp).
-7. **Port C++/Qt** sau khi bản Python chạy ổn định (hiệu năng capture/encode).
+3. **Dirty-rectangle/XDamage** + adaptive fps/quality theo băng thông.
+4. **Auth tốt hơn**: challenge-response, key trao đổi (đã có rate-limit).
+5. **Transport**: QUIC / WebRTC (NAT traversal, độ trễ thấp).
+6. **Port C++/Qt** sau khi bản Python chạy ổn định (hiệu năng capture/encode).

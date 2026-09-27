@@ -46,6 +46,7 @@ class FakeWorker(QObject):
     rejected = Signal(str)
     disconnected = Signal(str)
     clipboard_from_host = Signal(str)
+    monitors_ready = Signal(list, int)
 
     instances: list["FakeWorker"] = []
 
@@ -170,3 +171,50 @@ def test_input_method_commit_text(qapp):
     events.clear()
     view.inputMethodEvent(QInputMethodEvent("", []))  # preedit rỗng, không lỗi
     assert events == []
+
+
+MONITORS = [
+    {"index": 1, "width": 1920, "height": 1080, "left": 0, "top": 0,
+     "primary": True},
+    {"index": 2, "width": 1280, "height": 720, "left": 1920, "top": 0,
+     "primary": False},
+]
+
+
+def test_monitors_combo_populates(window):
+    win = window()
+    win._on_monitors_ready(MONITORS, 2)
+    assert win.monitor_combo.count() == 3
+    assert win.monitor_combo.itemText(0) == "Theo host"
+    assert "(chính)" in win.monitor_combo.itemText(1)
+    assert win.monitor_combo.isEnabled()
+    assert win.monitor_combo.currentData() == 2
+    assert win.monitor_combo.itemData(2) == 2
+
+
+def test_monitors_combo_single_monitor(window):
+    win = window()
+    win._on_monitors_ready(MONITORS[:1], 1)
+    assert win.monitor_combo.count() == 2
+    assert not win.monitor_combo.isEnabled()
+
+
+def test_monitor_change_sends_control(window):
+    win = window()
+    win.host_edit.setText("127.0.0.1")
+    win.token_edit.setText("t")
+    win._connect()
+    win._on_monitors_ready(MONITORS, 1)
+    win.monitor_combo.setCurrentIndex(2)   # chọn màn hình #2
+    assert win.worker.sent[-1] == {"event": "set_monitor", "index": 2}
+
+
+def test_monitor_combo_reset_on_disconnect(window):
+    win = window()
+    win.host_edit.setText("127.0.0.1")
+    win.token_edit.setText("t")
+    win._connect()
+    win._on_monitors_ready(MONITORS, 1)
+    win._disconnect("test")
+    assert win.monitor_combo.count() == 1
+    assert not win.monitor_combo.isEnabled()
