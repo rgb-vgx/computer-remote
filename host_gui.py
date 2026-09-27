@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
-from common import app_log_dir
+from common import app_log_dir, no_console_kwargs
 from common.updater import current_version
 from common.updater_qt import UpdateController
 from host import HostServer, detect_display, warn_weak_config
@@ -32,8 +32,12 @@ log = logging.getLogger("host_gui")
 
 
 # ---------------------------------------------------------------------------
-# Autostart (XDG autostart .desktop)
+# Autostart (Linux: XDG .desktop; Windows: registry Run key)
 # ---------------------------------------------------------------------------
+
+_AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_REG_NAME = "RemoteDesktopHost"
+
 
 def autostart_path() -> Path:
     config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
@@ -48,15 +52,11 @@ def _autostart_quote(arg: str) -> str:
 
 def write_autostart(token: str) -> Path:
     """Ghi file autostart trỏ tới app hiện tại (source hoặc bản đóng gói)."""
+    cmd = _autostart_command() + ["--token", token, "--auto-start"]
     if getattr(sys, "frozen", False):
-        exe = Path(sys.executable).resolve()
-        workdir = exe.parent
-        cmd = [str(exe)]
+        workdir = Path(sys.executable).resolve().parent
     else:
-        script = Path(__file__).resolve()
-        workdir = script.parent
-        cmd = [sys.executable, str(script)]
-    cmd += ["--token", token, "--auto-start"]
+        workdir = Path(__file__).resolve().parent
     exec_line = " ".join(_autostart_quote(a) for a in cmd)
     content = (
         "[Desktop Entry]\n"
@@ -79,6 +79,56 @@ def write_autostart(token: str) -> Path:
 
 def remove_autostart() -> None:
     autostart_path().unlink(missing_ok=True)
+
+
+def _autostart_command() -> list[str]:
+    """Lệnh chạy lại app này (source hoặc bản đóng gói)."""
+    if getattr(sys, "frozen", False):
+        return [str(Path(sys.executable).resolve())]
+    return [sys.executable, str(Path(__file__).resolve())]
+
+
+def _autostart_windows_enabled() -> bool:
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_PATH) as key:
+            winreg.QueryValueEx(key, _AUTOSTART_REG_NAME)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _set_autostart_windows(enabled: bool, token: str) -> None:
+    import winreg
+
+    value = subprocess.list2cmdline(_autostart_command() +
+                                    ["--token", token, "--auto-start"])
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_PATH, 0,
+                            winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, _AUTOSTART_REG_NAME, 0, winreg.REG_SZ, value)
+        else:
+            try:
+                winreg.DeleteValue(key, _AUTOSTART_REG_NAME)
+            except FileNotFoundError:
+                pass
+
+
+def autostart_enabled() -> bool:
+    if sys.platform == "win32":
+        return _autostart_windows_enabled()
+    return autostart_path().exists()
+
+
+def apply_autostart(enabled: bool, token: str) -> None:
+    """Bật/tắt khởi động cùng hệ thống theo platform hiện tại."""
+    if sys.platform == "win32":
+        _set_autostart_windows(enabled, token)
+    elif enabled:
+        write_autostart(token)
+    else:
+        remove_autostart()
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +262,7 @@ class MainWindow(QMainWindow):
         info_layout.addRow("Codec:", self.codec_combo)
 
         self.autostart_cb = QCheckBox("Khởi động cùng hệ thống")
-        self.autostart_cb.setChecked(autostart_path().exists())
+        self.autostart_cb.setChecked(autostart_enabled())
         self.autostart_cb.toggled.connect(self._on_autostart_toggled)
         info_layout.addRow("", self.autostart_cb)
 
@@ -263,14 +313,18 @@ class MainWindow(QMainWindow):
         self._clipboard_timer.timeout.connect(self._check_clipboard)
 
     def _get_ip(self) -> str:
-        try:
-            result = subprocess.run(
-                ["tailscale", "ip", "-4"],
-                capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except Exception:
-            pass
+        candidates = ["tailscale"]
+        if sys.platform == "win32":
+            candidates.append(r"C:\Program Files\Tailscale\tailscale.exe")
+        for exe in candidates:
+            try:
+                result = subprocess.run(
+                    [exe, "ip", "-4"], capture_output=True, text=True,
+                    timeout=5, **no_console_kwargs())
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip().splitlines()[0]
+            except Exception:
+                continue
         return "Không xác định"
 
     def _append_log(self, msg: str) -> None:
@@ -358,11 +412,12 @@ class MainWindow(QMainWindow):
 
     def _on_autostart_toggled(self, enabled: bool) -> None:
         try:
+            apply_autostart(enabled, self.token_edit.text())
             if enabled:
-                path = write_autostart(self.token_edit.text())
-                log.info("Bật khởi động cùng hệ thống: %s", path)
+                target = ("registry Run (HKCU)" if sys.platform == "win32"
+                          else str(autostart_path()))
+                log.info("Bật khởi động cùng hệ thống: %s", target)
             else:
-                remove_autostart()
                 log.info("Tắt khởi động cùng hệ thống")
         except OSError as exc:
             log.warning("Không đổi được autostart: %s", exc)
@@ -376,7 +431,7 @@ class MainWindow(QMainWindow):
         if not self.autostart_cb.isChecked():
             return
         try:
-            write_autostart(self.token_edit.text())
+            apply_autostart(True, self.token_edit.text())
         except OSError as exc:
             log.warning("Không cập nhật được autostart: %s", exc)
 

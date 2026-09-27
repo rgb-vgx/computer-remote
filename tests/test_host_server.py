@@ -1,7 +1,11 @@
 import socket
+import sys
 import threading
 import time
+import types
 from types import SimpleNamespace
+
+import pytest
 
 import host
 from common import protocol
@@ -105,3 +109,44 @@ def test_notify_guard():
     server._notify(None)         # None = bỏ qua
     server._notify(lambda: calls.append(1))
     assert calls == [1]
+
+
+def test_detect_display_non_linux(monkeypatch):
+    monkeypatch.setattr(host.sys, "platform", "win32")
+    assert host.detect_display() is True
+
+
+def test_clipboard_backend_windows(monkeypatch):
+    monkeypatch.setattr(host.sys, "platform", "win32")
+    server = make_server()
+    assert server.clipboard_get is host._clipboard_get_windows
+    assert server.clipboard_set is host._clipboard_set_windows
+
+
+def test_clipboard_backend_linux(monkeypatch):
+    if sys.platform == "win32":
+        pytest.skip("nhánh xclip chỉ có trên Linux")
+    monkeypatch.setattr(host.sys, "platform", "linux")
+    server = make_server()
+    assert server.clipboard_get is host._clipboard_get_xclip
+    assert server.clipboard_set is host._clipboard_set_xclip
+
+
+def test_pynput_keyboard_key_mapping(monkeypatch):
+    fake_kb = types.ModuleType("pynput.keyboard")
+
+    class Key:
+        enter = "ENTER"
+        esc = "ESC"
+
+    fake_kb.Key = Key
+    fake_pkg = types.ModuleType("pynput")
+    fake_pkg.keyboard = fake_kb
+    monkeypatch.setitem(sys.modules, "pynput", fake_pkg)
+    monkeypatch.setitem(sys.modules, "pynput.keyboard", fake_kb)
+
+    assert host.PynputKeyboard._key("Key.enter") == "ENTER"
+    assert host.PynputKeyboard._key("Key.return") == "ENTER"
+    assert host.PynputKeyboard._key("a") == "a"
+    with pytest.raises(AttributeError):
+        host.PynputKeyboard._key("Key.khong_ton_tai")

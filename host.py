@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""host.py — Remote desktop HOST (Kubuntu / X11).
+"""host.py — Remote desktop HOST (Linux/X11 hoặc Windows).
 
 Supports JPEG and H.264 codec. H.264 requires ffmpeg with libx264.
 
@@ -27,7 +27,7 @@ import cv2
 import mss
 import numpy as np
 
-from common import app_log_dir, protocol
+from common import app_log_dir, no_console_kwargs, protocol
 
 log = logging.getLogger("host")
 
@@ -72,13 +72,18 @@ class H264Encoder:
              '-f', 'h264',
              '-'],
             stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.DEVNULL,
-            bufsize=1024**2)
+            bufsize=1024**2, **no_console_kwargs())
 
         self._out = bytearray()
         self._out_lock = threading.Lock()
         self._closed = False
 
-        os.set_blocking(self._proc.stdout.fileno(), False)
+        try:
+            os.set_blocking(self._proc.stdout.fileno(), False)
+        except (OSError, AttributeError):
+            # Windows (một số bản Python): reader thread dùng blocking read,
+            # vẫn đúng vì nó chạy ở thread riêng.
+            pass
         self._reader = threading.Thread(
             target=self._reader_loop, name="h264-enc-out", daemon=True)
         self._reader.start()
@@ -134,7 +139,8 @@ class H264Encoder:
     @staticmethod
     def available() -> bool:
         try:
-            sp.run(['ffmpeg', '-version'], capture_output=True, timeout=2)
+            sp.run(['ffmpeg', '-version'], capture_output=True, timeout=2,
+                   **no_console_kwargs())
             return True
         except Exception:
             return False
@@ -142,7 +148,8 @@ class H264Encoder:
     @staticmethod
     def libx264_available() -> bool:
         try:
-            r = sp.run(['ffmpeg', '-encoders'], capture_output=True, text=True, timeout=2)
+            r = sp.run(['ffmpeg', '-encoders'], capture_output=True, text=True,
+                       timeout=2, **no_console_kwargs())
             return 'libx264' in r.stdout
         except Exception:
             return False
@@ -238,6 +245,39 @@ class X11Keyboard:
         self._display.sync()
 
 
+class PynputKeyboard:
+    """Inject bàn phím qua pynput trên Windows/macOS.
+
+    Client gửi phím đặc biệt dạng ``Key.<name>`` (theo pynput), còn lại là
+    ký tự thường. ``Key.return`` là alias cũ của ``Key.enter``.
+    """
+
+    def __init__(self) -> None:
+        from pynput.keyboard import Controller
+
+        self._kbd = Controller()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(key: str):
+        from pynput.keyboard import Key
+
+        if key.startswith("Key."):
+            name = key[4:]
+            if name == "return":
+                name = "enter"
+            return getattr(Key, name)
+        return key
+
+    def press(self, key: str) -> None:
+        with self._lock:
+            self._kbd.press(self._key(key))
+
+    def release(self, key: str) -> None:
+        with self._lock:
+            self._kbd.release(self._key(key))
+
+
 # ---------------------------------------------------------------------------
 # Clipboard helpers
 # ---------------------------------------------------------------------------
@@ -269,6 +309,39 @@ def _clipboard_get_xclip() -> str:
     return ""
 
 
+# Windows: dùng PowerShell (có sẵn trong Windows 10/11), ép UTF-8 để không
+# hỏng ký tự có dấu. GUI host override bằng Qt clipboard nên chỉ CLI dùng.
+
+def _clipboard_set_windows(text: str) -> None:
+    try:
+        sp.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "[Console]::InputEncoding=[Text.Encoding]::UTF8; "
+             "[Console]::In.ReadToEnd() | Set-Clipboard"],
+            input=text.encode("utf-8"), capture_output=True, timeout=4,
+            **no_console_kwargs())
+    except FileNotFoundError:
+        log.debug("powershell not found, clipboard set disabled")
+    except Exception as exc:
+        log.debug("powershell set clipboard error: %s", exc)
+
+
+def _clipboard_get_windows() -> str:
+    try:
+        p = sp.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+             "Get-Clipboard -Raw"],
+            capture_output=True, timeout=4, **no_console_kwargs())
+        if p.returncode == 0:
+            return p.stdout.decode("utf-8", errors="replace").rstrip("\r\n")
+    except FileNotFoundError:
+        log.debug("powershell not found, clipboard get disabled")
+    except Exception:
+        pass
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Environment check
 # ---------------------------------------------------------------------------
@@ -289,6 +362,9 @@ def detect_display() -> bool:
     Quét socket trong /tmp/.X11-unix, thử lần lượt các Xauthority khả dụng,
     chỉ nhận display capture được thật.
     """
+    if sys.platform != "linux":
+        # Windows/macOS: mss & pynput dùng API native, không cần X11.
+        return True
     if os.environ.get("DISPLAY"):
         return True
 
@@ -321,6 +397,9 @@ def detect_display() -> bool:
 
 
 def check_display_env() -> None:
+    if sys.platform != "linux":
+        log.info("Session %s — capture/input native, không cần X11.", sys.platform)
+        return
     detected = False
     if not os.environ.get("DISPLAY"):
         detected = detect_display()
@@ -360,8 +439,12 @@ class HostServer:
         self._clipboard_send_queue: queue.Queue[str] = queue.Queue()
         self._last_clipboard = ""
         self._clipboard_skip = 0
-        self.clipboard_get = _clipboard_get_xclip
-        self.clipboard_set = _clipboard_set_xclip
+        self.clipboard_get = (
+            _clipboard_get_windows if sys.platform == "win32"
+            else _clipboard_get_xclip)
+        self.clipboard_set = (
+            _clipboard_set_windows if sys.platform == "win32"
+            else _clipboard_set_xclip)
         self.on_clipboard_received = None
         # Callback cho GUI: nhận addr khi client kết nối/ngắt.
         self.on_client_connected = None
@@ -869,7 +952,10 @@ class HostServer:
     def _get_keyboard(self):
         if self._keyboard is None:
             try:
-                self._keyboard = X11Keyboard()
+                if sys.platform == "linux":
+                    self._keyboard = X11Keyboard()
+                else:
+                    self._keyboard = PynputKeyboard()
             except Exception as exc:
                 log.error("Không khởi tạo được keyboard: %s", exc)
                 self._keyboard = False
@@ -937,7 +1023,7 @@ def warn_weak_config(bind: str, token: str) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args(argv=None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Remote desktop HOST (Kubuntu/X11).")
+    p = argparse.ArgumentParser(description="Remote desktop HOST (X11 hoặc Windows).")
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--port", type=int, default=7777)
     p.add_argument("--token", default="1")

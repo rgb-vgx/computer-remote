@@ -19,3 +19,17 @@ def app_log_dir() -> Path:
     log_dir = base / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
+
+
+def no_console_kwargs() -> dict:
+    """Kwargs cho ``subprocess`` để không nháy cửa sổ console trên Windows.
+
+    App GUI đóng gói ở chế độ windowed vẫn tạo console mới cho mỗi
+    subprocess (ffmpeg, tailscale, powershell...) nếu không chặn.
+    """
+    if sys.platform == "win32":
+        import subprocess
+
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        return {"creationflags": flags}
+    return {}

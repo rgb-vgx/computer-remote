@@ -1,10 +1,14 @@
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# Không đọc/ghi autostart thật của máy chạy test (Linux).
+if sys.platform != "win32":
+    os.environ["XDG_CONFIG_HOME"] = tempfile.mkdtemp(prefix="remote-mvp-test-xdg-")
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:

@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QPushButton, QVBoxLayout, QWidget,
 )
 
-from common import app_log_dir, protocol
+from common import app_log_dir, no_console_kwargs, protocol
 from common.updater import current_version
 from common.updater_qt import UpdateController
 
@@ -69,7 +69,7 @@ class H264Decoder:
              '-pix_fmt', 'bgr24',
              '-'],
             stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.DEVNULL,
-            bufsize=1024**2)
+            bufsize=1024**2, **no_console_kwargs())
 
         self._reader = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader.start()
@@ -129,7 +129,8 @@ class H264Decoder:
     def available() -> bool:
         try:
             r = sp.run(['ffmpeg', '-version'],
-                       capture_output=True, timeout=2, shell=False)
+                       capture_output=True, timeout=2, shell=False,
+                       **no_console_kwargs())
             return r.returncode == 0
         except Exception:
             return False
