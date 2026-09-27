@@ -394,6 +394,8 @@ class RemoteView(QLabel):
         self.setText("Chưa kết nối")
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # Cho phép IME (bộ gõ tiếng Việt/CJK) commit text vào widget này.
+        self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
 
         self._pixmap: QPixmap | None = None
         self._draw_rect = (0, 0, 0, 0)
@@ -500,6 +502,21 @@ class RemoteView(QLabel):
         if key_str:
             self.key_event.emit({"event": "key_up", "key": key_str})
         super().keyReleaseEvent(event)
+
+    def inputMethodEvent(self, event) -> None:
+        """Text do IME/bộ gõ commit (Telex, Pinyin...) — gửi từng ký tự.
+
+        Qt không sinh keyPress cho text IME đã commit; nếu bỏ qua thì gõ
+        tiếng Việt/CJK bằng bộ gõ sẽ mất chữ.
+        """
+        commit = event.commitString()
+        for ch in commit:
+            self.key_event.emit({"event": "key_down", "key": ch})
+            self.key_event.emit({"event": "key_up", "key": ch})
+        if commit:
+            event.accept()
+            return
+        super().inputMethodEvent(event)
 
 
 # ---------------------------------------------------------------------------

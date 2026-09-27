@@ -175,13 +175,30 @@ for _i in range(1, 13):
     _KEY_NAME_TO_KEYSYM[f"f{_i}"] = 0xFFBE + _i - 1
 
 
+def key_to_keysym(key: str) -> int | None:
+    """Chuyển tên phím / ký tự client gửi thành X11 keysym.
+
+    Ký tự Unicode > 0xFF dùng keysym ``0x01000000 + codepoint`` (chuẩn X11),
+    nhờ vậy gõ được cả ký tự không có trong layout host (tiếng Việt có dấu,
+    CJK...) bằng cách remap tạm 1 keycode trống.
+    """
+    name = key[4:] if key.startswith("Key.") else key
+    if name in _KEY_NAME_TO_KEYSYM:
+        return _KEY_NAME_TO_KEYSYM[name]
+    if len(name) == 1:
+        cp = ord(name)
+        return cp if cp < 0x100 else 0x01000000 + cp
+    return None
+
+
 class X11Keyboard:
     """Inject bàn phím qua XTEST (cùng cách xdotool).
 
     XTEST hoạt động với mọi app: Qt/KDE, GTK, terminal, và cả
     Electron/Chromium (VS Code) — trong khi XSendEvent bị Chromium bỏ qua.
     Ký tự cần Shift/AltGr được bọc bằng phím modifier tạm thời (nếu
-    modifier đó chưa được giữ).
+    modifier đó chưa được giữ). Ký tự ngoài layout host được inject bằng
+    cách remap tạm một keycode trống sang Unicode keysym.
     """
 
     def __init__(self) -> None:
@@ -190,6 +207,11 @@ class X11Keyboard:
         self._display = display.Display()
         self._xtest = xtest
         self._lock = threading.Lock()
+        # Keycode trống dùng để remap ký tự Unicode ngoài layout.
+        self._spare: int | None = None
+        self._spare_original: list[int] | None = None
+        self._spare_keysym: int | None = None
+        self._restore_timer: threading.Timer | None = None
 
     def press(self, key: str) -> None:
         with self._lock:
@@ -199,23 +221,75 @@ class X11Keyboard:
         with self._lock:
             self._inject(key, is_press=False)
 
-    def _keysym(self, key: str) -> int | None:
-        name = key[4:] if key.startswith("Key.") else key
-        if name in _KEY_NAME_TO_KEYSYM:
-            return _KEY_NAME_TO_KEYSYM[name]
-        if len(name) == 1:
-            return ord(name)
-        return None
+    def _spare_keycode(self) -> int | None:
+        if self._spare is None:
+            for keycode in range(8, 256):
+                mapping = self._display.get_keyboard_mapping(keycode, 1)
+                if mapping and not any(mapping[0]):
+                    self._spare = keycode
+                    break
+        return self._spare
+
+    def _inject_unicode(self, keysym: int, is_press: bool) -> None:
+        """Gõ ký tự ngoài layout: remap tạm 1 keycode (kỹ thuật xdotool)."""
+        from Xlib import X
+
+        keycode = self._spare_keycode()
+        if keycode is None:
+            log.warning("Không tìm được keycode trống để inject Unicode")
+            return
+        if self._spare_keysym != keysym:
+            if self._restore_timer is not None:
+                # Huỷ khôi phục đang chờ để không đổi mapping giữa chừng.
+                self._restore_timer.cancel()
+                self._restore_timer = None
+            if self._spare_original is None:
+                self._spare_original = list(
+                    self._display.get_keyboard_mapping(keycode, 1)[0])
+            self._display.change_keyboard_mapping(keycode, [[keysym] * 4])
+            self._display.sync()
+            self._spare_keysym = keysym
+        self._xtest.fake_input(
+            self._display, X.KeyPress if is_press else X.KeyRelease, keycode)
+        self._display.sync()
+        if not is_press:
+            self._schedule_restore()
+
+    def _schedule_restore(self) -> None:
+        if self._restore_timer is not None:
+            self._restore_timer.cancel()
+        self._restore_timer = threading.Timer(0.1, self._restore_mapping)
+        self._restore_timer.daemon = True
+        self._restore_timer.start()
+
+    def _restore_mapping(self) -> None:
+        with self._lock:
+            if self._spare is None or self._spare_original is None:
+                return
+            try:
+                self._display.change_keyboard_mapping(
+                    self._spare, [self._spare_original])
+                self._display.sync()
+            except Exception as exc:
+                log.debug("Không khôi phục được keymap: %s", exc)
+            self._spare_original = None
+            self._spare_keysym = None
 
     def _inject(self, key: str, is_press: bool) -> None:
         from Xlib import X
 
-        keysym = self._keysym(key)
+        keysym = key_to_keysym(key)
         if keysym is None:
             log.warning("Unknown special key: %s", key)
             return
         keycode = self._display.keysym_to_keycode(keysym)
         if not keycode:
+            if len(key) == 1 and not key.startswith("Key."):
+                # Ký tự không có trong layout host → inject Unicode trực tiếp.
+                log.debug("Ký tự %r ngoài layout, inject Unicode keysym 0x%X",
+                          key, keysym)
+                self._inject_unicode(keysym, is_press)
+                return
             log.warning("Không map được phím %r trên layout hiện tại", key)
             return
 
@@ -245,11 +319,57 @@ class X11Keyboard:
         self._display.sync()
 
 
+_KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_UNICODE = 0x0004
+
+
+def _send_unicode_windows(char: str) -> bool:
+    """Gõ 1 ký tự Unicode trực tiếp trên Windows (SendInput KEYEVENTF_UNICODE).
+
+    Dùng khi ký tự không có trong layout bàn phím host (pynput VkKeyScan lỗi).
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", wintypes.WORD),
+                ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ]
+
+        class INPUT(ctypes.Structure):
+            class _U(ctypes.Union):
+                _fields_ = [("ki", KEYBDINPUT)]
+
+            _anonymous_ = ("u",)
+            _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+        scan = ord(char)
+        if scan > 0xFFFF:
+            return False  # ngoài BMP: cần surrogate pair, chưa hỗ trợ
+        inputs = (INPUT * 2)()
+        for i, flags in enumerate((_KEYEVENTF_UNICODE,
+                                   _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP)):
+            inputs[i].type = 1  # INPUT_KEYBOARD
+            inputs[i].ki = KEYBDINPUT(0, scan, flags, 0, None)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        sent = user32.SendInput(2, ctypes.byref(inputs), ctypes.sizeof(INPUT))
+        return sent == 2
+    except Exception as exc:
+        log.debug("SendInput Unicode lỗi: %s", exc)
+        return False
+
+
 class PynputKeyboard:
     """Inject bàn phím qua pynput trên Windows/macOS.
 
     Client gửi phím đặc biệt dạng ``Key.<name>`` (theo pynput), còn lại là
-    ký tự thường. ``Key.return`` là alias cũ của ``Key.enter``.
+    ký tự thường. ``Key.return`` là alias cũ của ``Key.enter``. Ký tự ngoài
+    layout host được gõ bằng SendInput Unicode (xem ``_send_unicode_windows``).
     """
 
     def __init__(self) -> None:
@@ -257,6 +377,8 @@ class PynputKeyboard:
 
         self._kbd = Controller()
         self._lock = threading.Lock()
+        # Ký tự đã gửi bằng Unicode SendInput (press gửi cả down+up).
+        self._unicode_pending: set[str] = set()
 
     @staticmethod
     def _key(key: str):
@@ -271,11 +393,25 @@ class PynputKeyboard:
 
     def press(self, key: str) -> None:
         with self._lock:
-            self._kbd.press(self._key(key))
+            try:
+                self._kbd.press(self._key(key))
+                return
+            except Exception:
+                pass
+            if len(key) == 1 and _send_unicode_windows(key):
+                self._unicode_pending.add(key)
+            else:
+                log.warning("Không inject được phím %r trên layout hiện tại", key)
 
     def release(self, key: str) -> None:
         with self._lock:
-            self._kbd.release(self._key(key))
+            if key in self._unicode_pending:
+                self._unicode_pending.discard(key)
+                return
+            try:
+                self._kbd.release(self._key(key))
+            except Exception as exc:
+                log.debug("Keyboard release error (%s): %s", key, exc)
 
 
 # ---------------------------------------------------------------------------

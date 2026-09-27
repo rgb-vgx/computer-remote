@@ -251,8 +251,10 @@ cần cài tay một lần, sau đó update trong app.
   host Windows không cần X11.
 - Codec **JPEG từng frame** mặc định (H.264 cần ffmpeg, giảm băng thông
   nhưng thêm 1–2 frame delay do decode).
-- Chỉ **mouse** (move / click trái, phải / scroll) và **keyboard** (ký tự,
-  phím đặc biệt, modifier). Chưa hỗ trợ dead-key / IME phức tạp.
+- **Keyboard**: ký tự/phím đặc biệt/modifier, kể cả **ký tự Unicode ngoài layout
+  host** (tiếng Việt có dấu, CJK...) — inject trực tiếp qua X11 keysym-remap /
+  Windows SendInput Unicode. Text do IME/bộ gõ phía **client** commit được gửi
+  nguyên ký tự; compose IME ngay trên host vẫn có thể lệch.
 - Clipboard chỉ text; không multi-monitor, không audio, không file transfer.
 - Token đơn giản (đã so constant-time + khóa IP sau 5 lần sai), không TLS
   tầng ứng dụng (dựa vào Tailscale).
@@ -277,7 +279,7 @@ release workflow còn chạy smoke test cài đặt updater trên cả Linux/Win
 
 1. **Video codec**: encode/decode trong process (PyAV) hoặc hardware
    (VAAPI/NVENC) để giảm latency và CPU.
-2. **Clipboard ảnh/file**, dead-key / IME.
+2. **Clipboard ảnh/file**.
 3. **Multi-monitor**: chọn / chuyển màn hình.
 4. **Dirty-rectangle/XDamage** + adaptive fps/quality theo băng thông.
 5. **Auth tốt hơn**: challenge-response, key trao đổi (đã có rate-limit).

@@ -150,3 +150,71 @@ def test_pynput_keyboard_key_mapping(monkeypatch):
     assert host.PynputKeyboard._key("a") == "a"
     with pytest.raises(AttributeError):
         host.PynputKeyboard._key("Key.khong_ton_tai")
+
+
+def test_key_to_keysym():
+    assert host.key_to_keysym("a") == 0x61
+    assert host.key_to_keysym("é") == 0xE9
+    assert host.key_to_keysym("ế") == 0x01000000 + 0x1EBF
+    assert host.key_to_keysym("中") == 0x01000000 + 0x4E2D
+    assert host.key_to_keysym("Key.enter") == 0xFF0D
+    assert host.key_to_keysym("Key.return") == 0xFF0D
+    assert host.key_to_keysym("ab") is None
+    assert host.key_to_keysym("Key.khong_ton_tai") is None
+
+
+def _fake_pynput(monkeypatch, controller_cls):
+    fake_kb = types.ModuleType("pynput.keyboard")
+    fake_kb.Controller = controller_cls
+
+    class Key:
+        enter = "ENTER"
+
+    fake_kb.Key = Key
+    fake_pkg = types.ModuleType("pynput")
+    fake_pkg.keyboard = fake_kb
+    monkeypatch.setitem(sys.modules, "pynput", fake_pkg)
+    monkeypatch.setitem(sys.modules, "pynput.keyboard", fake_kb)
+
+
+def test_pynput_keyboard_unicode_fallback(monkeypatch):
+    calls = []
+
+    class FakeController:
+        def press(self, key):
+            if key == "ế":
+                raise ValueError("không có trong layout")
+            calls.append(("press", key))
+
+        def release(self, key):
+            calls.append(("release", key))
+
+    _fake_pynput(monkeypatch, FakeController)
+    monkeypatch.setattr(host, "_send_unicode_windows",
+                        lambda ch: calls.append(("unicode", ch)) or True)
+
+    kbd = host.PynputKeyboard()
+    kbd.press("a")
+    kbd.release("a")
+    kbd.press("ế")
+    kbd.release("ế")  # Unicode press đã gửi cả down+up
+    assert calls == [("press", "a"), ("release", "a"), ("unicode", "ế")]
+
+
+def test_pynput_keyboard_unicode_send_fail(monkeypatch):
+    calls = []
+
+    class FakeController:
+        def press(self, key):
+            raise ValueError("không có trong layout")
+
+        def release(self, key):
+            calls.append(("release", key))
+
+    _fake_pynput(monkeypatch, FakeController)
+    monkeypatch.setattr(host, "_send_unicode_windows", lambda ch: False)
+
+    kbd = host.PynputKeyboard()
+    kbd.press("ế")      # Unicode gửi thất bại → cảnh báo, không crash
+    kbd.release("ế")
+    assert calls == [("release", "ế")]

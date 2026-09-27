@@ -147,3 +147,26 @@ def test_frame_size_label(window):
     img.fill(0)
     win._on_frame_ready(img)
     assert win.size_label.text() == "1280x720"
+
+
+def test_input_method_commit_text(qapp):
+    from PySide6.QtGui import QInputMethodEvent
+
+    view = client.RemoteView()
+    assert view.testAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled)
+    events = []
+    view.key_event.connect(events.append)
+
+    ev = QInputMethodEvent("", [])
+    ev.setCommitString("ếa")
+    view.inputMethodEvent(ev)
+    assert events == [
+        {"event": "key_down", "key": "ế"},
+        {"event": "key_up", "key": "ế"},
+        {"event": "key_down", "key": "a"},
+        {"event": "key_up", "key": "a"},
+    ]
+
+    events.clear()
+    view.inputMethodEvent(QInputMethodEvent("", []))  # preedit rỗng, không lỗi
+    assert events == []
