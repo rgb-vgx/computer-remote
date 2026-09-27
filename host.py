@@ -20,6 +20,7 @@ import subprocess as sp
 import sys
 import threading
 import time
+from logging.handlers import RotatingFileHandler
 
 import cv2
 import mss
@@ -357,6 +358,33 @@ class HostServer:
         self.clipboard_get = _clipboard_get_xclip
         self.clipboard_set = _clipboard_set_xclip
         self.on_clipboard_received = None
+        # Callback cho GUI: nhận addr khi client kết nối/ngắt.
+        self.on_client_connected = None
+        self.on_client_disconnected = None
+        self._client_stop: threading.Event | None = None
+        self._client_sock: socket.socket | None = None
+
+    def _notify(self, callback, *args) -> None:
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except Exception as exc:
+            log.warning("Callback lỗi: %s", exc)
+
+    def disconnect_client(self) -> None:
+        """Ngắt client đang kết nối (dùng cho nút trên host GUI)."""
+        sock, stop = self._client_sock, self._client_stop
+        if sock is not None:
+            try:
+                protocol.send_json(sock, protocol.PKT_INFO,
+                                   {"type": "error",
+                                    "message": "host đã ngắt kết nối"})
+            except OSError:
+                pass
+        if stop is not None:
+            stop.set()
+        _safe_close(sock)
 
     def send_clipboard(self, text: str) -> None:
         self._clipboard_send_queue.put_nowait(text)
@@ -377,13 +405,17 @@ class HostServer:
             except OSError:
                 break
             log.info("Client kết nối từ %s:%d", *addr)
+            self._notify(self.on_client_connected, addr)
             try:
                 self._handle_client(client_sock, addr)
             except Exception as exc:
                 log.error("Lỗi xử lý client %s: %s", addr, exc)
             finally:
                 _safe_close(client_sock)
+                self._client_sock = None
+                self._client_stop = None
                 log.info("Client %s:%d đã ngắt", *addr)
+                self._notify(self.on_client_disconnected)
 
     def shutdown(self) -> None:
         self.stop_event.set()
@@ -424,6 +456,8 @@ class HostServer:
 
         sock.settimeout(None)
         client_stop = threading.Event()
+        self._client_stop = client_stop
+        self._client_sock = sock
 
         send_thread = threading.Thread(
             target=self._capture_loop, args=(sock, client_stop),
@@ -873,7 +907,8 @@ def main() -> int:
 
     try:
         log_path = app_log_dir() / "host.log"
-        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh = RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024,
+                                 backupCount=3, encoding="utf-8")
         fh.setLevel(level)
         fh.setFormatter(logging.Formatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"))

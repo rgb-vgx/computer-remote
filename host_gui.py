@@ -12,6 +12,7 @@ import logging
 import os
 import subprocess
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal
@@ -103,7 +104,8 @@ def _setup_logging(debug: bool) -> None:
     log_path = None
     try:
         log_path = app_log_dir() / "host.log"
-        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh = RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024,
+                                 backupCount=3, encoding="utf-8")
         fh.setLevel(level)
         fh.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
         logging.getLogger().addHandler(fh)
@@ -128,6 +130,8 @@ def _setup_logging(debug: bool) -> None:
 class ServerThread(QThread):
     status_changed = Signal(str)
     clipboard_from_client = Signal(str)
+    client_connected = Signal(str)
+    client_disconnected = Signal()
 
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__()
@@ -140,6 +144,9 @@ class ServerThread(QThread):
         self.server.clipboard_get = lambda: ""
         self.server.clipboard_set = lambda text: None
         self.server.on_clipboard_received = self._on_clipboard
+        self.server.on_client_connected = lambda addr: self.client_connected.emit(
+            f"{addr[0]}:{addr[1]}")
+        self.server.on_client_disconnected = lambda: self.client_disconnected.emit()
 
         self.status_changed.emit("Đang lắng nghe...")
         try:
@@ -147,6 +154,7 @@ class ServerThread(QThread):
         except Exception as exc:
             log.error("Server dừng: %s", exc)
         finally:
+            self.client_disconnected.emit()
             self.status_changed.emit("Đã dừng")
 
     def _on_clipboard(self, text: str) -> None:
@@ -216,10 +224,17 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Chưa chạy")
         self.status_label.setStyleSheet("font-weight: bold; padding: 4px;")
         status_layout.addWidget(self.status_label)
+        self.client_label = QLabel("Client: chưa có")
+        self.client_label.setStyleSheet("padding: 4px; color: #666;")
+        status_layout.addWidget(self.client_label)
         btn_row = QHBoxLayout()
         self.start_stop_btn = QPushButton("Bắt đầu")
         self.start_stop_btn.clicked.connect(self._toggle_server)
         btn_row.addWidget(self.start_stop_btn)
+        self.kick_btn = QPushButton("Ngắt client")
+        self.kick_btn.setEnabled(False)
+        self.kick_btn.clicked.connect(self._kick_client)
+        btn_row.addWidget(self.kick_btn)
         self.update_btn = QPushButton("Cập nhật")
         self.update_btn.clicked.connect(self._check_update)
         btn_row.addWidget(self.update_btn)
@@ -284,11 +299,15 @@ class MainWindow(QMainWindow):
         self.server_thread.status_changed.connect(self._on_status_changed)
         self.server_thread.finished.connect(self._on_server_finished)
         self.server_thread.clipboard_from_client.connect(self._on_clipboard_from_client)
+        self.server_thread.client_connected.connect(self._on_client_connected)
+        self.server_thread.client_disconnected.connect(self._on_client_disconnected)
         self.server_thread.start()
 
         self.start_stop_btn.setText("Dừng")
         self.token_edit.setEnabled(False)
         self.status_label.setText("Đang khởi động...")
+        self.client_label.setText("Client: chưa có")
+        self.kick_btn.setEnabled(False)
 
         # Start clipboard polling
         self._last_clipboard = ""
@@ -304,9 +323,27 @@ class MainWindow(QMainWindow):
         self.start_stop_btn.setText("Bắt đầu")
         self.token_edit.setEnabled(True)
         self.status_label.setText("Đã dừng")
+        self.client_label.setText("Client: chưa có")
+        self.kick_btn.setEnabled(False)
 
     def _on_status_changed(self, status: str) -> None:
         self.status_label.setText(status)
+
+    def _on_client_connected(self, addr: str) -> None:
+        self.client_label.setText(f"Client: {addr}")
+        self.kick_btn.setEnabled(True)
+        if self.tray_manager and self.tray_manager.icon:
+            self.tray_manager.icon.showMessage(
+                "Remote Desktop Host", f"Client kết nối: {addr}")
+
+    def _on_client_disconnected(self) -> None:
+        self.client_label.setText("Client: chưa có")
+        self.kick_btn.setEnabled(False)
+
+    def _kick_client(self) -> None:
+        if self.server_thread is not None and self.server_thread.server is not None:
+            log.info("Ngắt client theo yêu cầu từ GUI")
+            self.server_thread.server.disconnect_client()
 
     def _on_server_finished(self) -> None:
         self._clipboard_timer.stop()
@@ -314,6 +351,8 @@ class MainWindow(QMainWindow):
         self.start_stop_btn.setText("Bắt đầu")
         self.token_edit.setEnabled(True)
         self.status_label.setText("Đã dừng")
+        self.client_label.setText("Client: chưa có")
+        self.kick_btn.setEnabled(False)
 
     # ---- Autostart -------------------------------------------------------
 

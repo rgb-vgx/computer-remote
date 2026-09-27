@@ -19,10 +19,11 @@ import subprocess as sp
 import sys
 import threading
 import time
+from logging.handlers import RotatingFileHandler
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QImage, QIntValidator, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QHBoxLayout, QLabel, QLineEdit,
@@ -178,7 +179,8 @@ def _setup_logging(debug: bool) -> None:
     logging.basicConfig(level=level, format=fmt, datefmt="%H:%M:%S")
     try:
         log_path = app_log_dir() / "client.log"
-        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh = RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024,
+                                 backupCount=3, encoding="utf-8")
         fh.setLevel(level)
         fh.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
         logging.getLogger().addHandler(fh)
@@ -196,6 +198,8 @@ def _setup_logging(debug: bool) -> None:
 class NetworkWorker(QThread):
     frame_ready = Signal(QImage)
     status = Signal(str)
+    connected = Signal()
+    rejected = Signal(str)   # host từ chối (sai token, bị ngắt) — không retry
     disconnected = Signal(str)
     clipboard_from_host = Signal(str)
 
@@ -291,7 +295,7 @@ class NetworkWorker(QThread):
                     continue
                 msg = info.get("message", "")
                 if info.get("type") == "error":
-                    self.disconnected.emit(f"Host từ chối: {msg}")
+                    self.rejected.emit(f"Host từ chối: {msg}")
                     return
                 elif info.get("type") == "codec":
                     c = info.get("codec", "")
@@ -325,6 +329,7 @@ class NetworkWorker(QThread):
                     continue
                 log.info("Kết nối thành công — %s", msg)
                 self.status.emit(f"Đã kết nối — {msg}")
+                self.connected.emit()
 
     def _flush_control(self) -> None:
         assert self._sock is not None
@@ -585,11 +590,47 @@ class MainWindow(QMainWindow):
         self._clipboard_timer = QTimer(self)
         self._clipboard_timer.timeout.connect(self._check_clipboard)
 
+        self.settings = QSettings("computer-remote", "remote-client")
+        self._want_connected = False
+        self._reconnect_attempts = 0
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setSingleShot(True)
+        self._reconnect_timer.timeout.connect(self._reconnect_now)
+        self._restore_settings()
+
+    # ---- Settings --------------------------------------------------------
+
+    def _restore_settings(self) -> None:
+        host = self.settings.value("host", "", str)
+        if host:
+            self.host_edit.setText(host)
+        self.port_edit.setText(self.settings.value("port", "7777", str))
+        token = self.settings.value("token", "", str)
+        if token:
+            self.token_edit.setText(token)
+        resolution = self.settings.value("resolution", "", str)
+        if resolution:
+            index = self.res_combo.findText(resolution)
+            if index >= 0:
+                self.res_combo.setCurrentIndex(index)
+            else:
+                self.res_combo.setEditText(resolution)
+        geometry = self.settings.value("geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+
+    def _save_settings(self) -> None:
+        self.settings.setValue("host", self.host_edit.text().strip())
+        self.settings.setValue("port", self.port_edit.text().strip())
+        self.settings.setValue("token", self.token_edit.text())
+        self.settings.setValue("resolution", self.res_combo.currentText())
+        self.settings.setValue("geometry", self.saveGeometry())
+
     def _toggle_connection(self) -> None:
-        if self.worker is None:
-            self._connect()
-        else:
+        if self._want_connected or self.worker is not None:
             self._disconnect("Đã ngắt bởi người dùng")
+        else:
+            self._connect()
 
     def _check_update(self) -> None:
         self.updater.start()
@@ -637,12 +678,18 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Trạng thái: Cần nhập Host và Token")
             return
 
+        self._reconnect_timer.stop()
+        self._want_connected = True
+        self._save_settings()
+
         log.info("Đang kết nối tới %s:%d ...", host, port)
         self.worker = NetworkWorker(host, port, token)
         self.worker.frame_ready.connect(self.view.set_frame)
         self.worker.frame_ready.connect(self._on_frame_ready)
         self.worker.status.connect(
             lambda m: self.status_label.setText(f"Trạng thái: {m}"))
+        self.worker.connected.connect(self._on_connected)
+        self.worker.rejected.connect(self._on_rejected)
         self.worker.disconnected.connect(self._on_disconnected)
         self.worker.clipboard_from_host.connect(self._on_clipboard_from_host)
         self.worker.start()
@@ -653,28 +700,62 @@ class MainWindow(QMainWindow):
 
         self.connect_btn.setText("Disconnect")
         self._set_form_enabled(False)
-        self.status_label.setText("Trạng thái: Connecting...")
+        if self._reconnect_attempts == 0:
+            self.status_label.setText("Trạng thái: Connecting...")
         self.view.setFocus()  # để phím đi vào RemoteView ngay từ đầu
 
         self._last_clipboard = ""
         self._clipboard_skip = 0
         self._clipboard_timer.start(500)
 
-    def _disconnect(self, reason: str) -> None:
-        log.info("Ngắt kết nối: %s", reason)
+    def _on_connected(self) -> None:
+        self._reconnect_attempts = 0
+
+    def _on_rejected(self, reason: str) -> None:
+        # Host từ chối (sai token / bị ngắt) — dừng hẳn, không thử lại.
+        self._want_connected = False
+        self._disconnect(reason)
+
+    def _on_disconnected(self, reason: str) -> None:
+        self._teardown_worker()
+        if self._want_connected:
+            self._reconnect_attempts += 1
+            delay = min(10, 2 ** min(self._reconnect_attempts - 1, 4))
+            self.status_label.setText(
+                f"Trạng thái: Mất kết nối — thử lại sau {delay}s "
+                f"(lần {self._reconnect_attempts}): {reason}")
+            log.info("Sẽ kết nối lại sau %ds (lần %d): %s",
+                     delay, self._reconnect_attempts, reason)
+            self._reconnect_timer.start(delay * 1000)
+            return
+        self._disconnect(reason)
+
+    def _reconnect_now(self) -> None:
+        if not self._want_connected:
+            return
+        if not self.isVisible():
+            self._disconnect("Cửa sổ đã đóng")
+            return
+        self._connect()
+
+    def _teardown_worker(self) -> None:
         self._clipboard_timer.stop()
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(2000)
             self.worker = None
+
+    def _disconnect(self, reason: str) -> None:
+        log.info("Ngắt kết nối: %s", reason)
+        self._want_connected = False
+        self._reconnect_timer.stop()
+        self._reconnect_attempts = 0
+        self._teardown_worker()
         self.connect_btn.setText("Connect")
         self._set_form_enabled(True)
         self.view.clear_frame("Disconnected")
         self.size_label.setText("")
         self.status_label.setText(f"Trạng thái: Disconnected ({reason})")
-
-    def _on_disconnected(self, reason: str) -> None:
-        self._disconnect(reason)
 
     def _set_form_enabled(self, enabled: bool) -> None:
         for w in (self.host_edit, self.port_edit, self.token_edit):
@@ -690,6 +771,9 @@ class MainWindow(QMainWindow):
             self.worker.send_control(event)
 
     def closeEvent(self, event) -> None:
+        self._want_connected = False
+        self._reconnect_timer.stop()
+        self._save_settings()
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(2000)

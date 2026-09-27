@@ -94,6 +94,13 @@ tùy ý trong khoảng 160–7680. Chọn **Theo host** để giữ đúng tham 
 `--max-width` lúc host khởi động. Với H.264, host tạo lại encoder và client
 tạo lại decoder tương ứng. Góc phải dưới hiện kích thước frame đang nhận.
 
+Client tự lưu Host/Port/Token/độ phân giải/kích thước cửa sổ cho lần sau. Khi
+mất mạng, client **tự kết nối lại** (1s → 2s → 4s → 8s → 10s); nếu host từ
+chối (sai token hoặc chủ động ngắt) thì dừng và hiện lý do.
+
+Host GUI (`remote-host-gui`) hiện client đang kết nối, báo qua tray icon, và
+có nút **Ngắt client** để đá client ra.
+
 ## 6. Nếu bật UFW trên Kubuntu
 
 Chỉ mở cổng trên interface Tailscale (không mở ra LAN/Internet):
@@ -234,7 +241,6 @@ cần cài tay một lần, sau đó update trong app.
 - Chỉ **mouse** (move / click trái, phải / scroll) và **keyboard** (ký tự,
   phím đặc biệt, modifier). Chưa hỗ trợ dead-key / IME phức tạp.
 - Clipboard chỉ text; không multi-monitor, không audio, không file transfer.
-- Không tự reconnect; mất kết nối thì bấm Connect lại.
 - Token đơn giản, không TLS tầng ứng dụng (dựa vào Tailscale).
 
 ---
