@@ -23,10 +23,10 @@ import time
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QImage, QIntValidator, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QPushButton, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QPushButton, QVBoxLayout, QWidget,
 )
 
 from common import app_log_dir, protocol
@@ -523,14 +523,29 @@ class MainWindow(QMainWindow):
         self.updater = UpdateController(self, "client")
 
         self.res_combo = QComboBox()
+        self.res_combo.setEditable(True)
+        self.res_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.res_combo.lineEdit().setValidator(
+            QIntValidator(160, 7680, self.res_combo))
         self.res_combo.addItem("Theo host", None)
-        for width in (3840, 1920, 1600, 1280, 1024, 800, 640):
-            self.res_combo.addItem(str(width), width)
+        for label, width in (
+            ("3840 (4K UHD)", 3840), ("2560 (QHD)", 2560),
+            ("1920 (Full HD)", 1920), ("1680", 1680), ("1600 (HD+)", 1600),
+            ("1440", 1440), ("1366", 1366), ("1280 (HD)", 1280),
+            ("1152", 1152), ("1024", 1024), ("960", 960), ("854", 854),
+            ("800", 800), ("720 (HD)", 720), ("640", 640), ("480", 480),
+            ("384", 384), ("320", 320),
+        ):
+            self.res_combo.addItem(label, width)
+        self.res_combo.setCurrentIndex(0)
         self.res_combo.setToolTip(
-            "Độ phân giải stream tối đa (max-width).\n"
+            "Độ phân giải stream tối đa (max-width, 160–7680).\n"
             "Thấp hơn = mượt hơn, ít băng thông hơn.\n"
-            "'Theo host' = giữ nguyên tham số --max-width của host.")
+            "'Theo host' = giữ nguyên tham số --max-width của host.\n"
+            "Có thể gõ số tùy ý.")
         self.res_combo.currentIndexChanged.connect(self._on_resolution_changed)
+        self.res_combo.lineEdit().editingFinished.connect(
+            self._on_resolution_edited)
 
         form = QHBoxLayout()
         form.addWidget(QLabel("Host:"))
@@ -551,12 +566,19 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("padding: 4px;")
         self.status_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.size_label = QLabel("")
+        self.size_label.setStyleSheet("padding: 4px; color: #888;")
+        self.size_label.setToolTip("Kích thước frame nhận được từ host")
+
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.status_label, stretch=1)
+        bottom.addWidget(self.size_label)
 
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.addLayout(form)
         layout.addWidget(self.view, stretch=1)
-        layout.addWidget(self.status_label)
+        layout.addLayout(bottom)
         self.setCentralWidget(central)
         self.resize(1100, 720)
 
@@ -572,11 +594,36 @@ class MainWindow(QMainWindow):
     def _check_update(self) -> None:
         self.updater.start()
 
-    def _on_resolution_changed(self) -> None:
+    def _selected_width(self) -> int | None:
+        """Width đang chọn: None = 'Theo host', số = max-width cụ thể."""
+        text = self.res_combo.currentText().strip()
+        if not text or text.lower().startswith("theo"):
+            return None
+        first = text.split()[0]
+        if not first.isdigit():
+            return None
+        return max(160, min(7680, int(first)))
+
+    def _send_resolution(self) -> None:
         if self.worker is not None:
             self.worker.send_control(
-                {"event": "set_resolution",
-                 "max_width": self.res_combo.currentData()})
+                {"event": "set_resolution", "max_width": self._selected_width()})
+
+    def _on_resolution_changed(self, _index: int = -1) -> None:
+        self._send_resolution()
+
+    def _on_resolution_edited(self) -> None:
+        # Chỉ chuẩn hoá khi user gõ tay (index = -1), giữ nguyên nhãn preset.
+        if self.res_combo.currentIndex() < 0:
+            width = self._selected_width()
+            if width is not None and self.res_combo.currentText() != str(width):
+                self.res_combo.setEditText(str(width))
+        self._send_resolution()
+
+    def _on_frame_ready(self, img) -> None:
+        size = f"{img.width()}x{img.height()}"
+        if self.size_label.text() != size:
+            self.size_label.setText(size)
 
     def _connect(self) -> None:
         host = self.host_edit.text().strip()
@@ -593,12 +640,13 @@ class MainWindow(QMainWindow):
         log.info("Đang kết nối tới %s:%d ...", host, port)
         self.worker = NetworkWorker(host, port, token)
         self.worker.frame_ready.connect(self.view.set_frame)
+        self.worker.frame_ready.connect(self._on_frame_ready)
         self.worker.status.connect(
             lambda m: self.status_label.setText(f"Trạng thái: {m}"))
         self.worker.disconnected.connect(self._on_disconnected)
         self.worker.clipboard_from_host.connect(self._on_clipboard_from_host)
         self.worker.start()
-        width = self.res_combo.currentData()
+        width = self._selected_width()
         if width is not None:
             self.worker.send_control(
                 {"event": "set_resolution", "max_width": width})
@@ -622,6 +670,7 @@ class MainWindow(QMainWindow):
         self.connect_btn.setText("Connect")
         self._set_form_enabled(True)
         self.view.clear_frame("Disconnected")
+        self.size_label.setText("")
         self.status_label.setText(f"Trạng thái: Disconnected ({reason})")
 
     def _on_disconnected(self, reason: str) -> None:

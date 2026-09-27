@@ -89,9 +89,10 @@ Bấm **Connect**. Di chuột / click trái / click phải trong vùng hiển th
 khiển host. Bấm **Disconnect** (hoặc đóng cửa sổ) để dừng.
 
 Combo **Độ phân giải** đổi `max-width` của stream ngay khi đang xem (thấp hơn
-= mượt hơn, ít băng thông hơn); chọn **Theo host** để giữ đúng tham số
+= mượt hơn, ít băng thông hơn): nhiều preset từ 320 đến 3840 (4K), hoặc gõ số
+tùy ý trong khoảng 160–7680. Chọn **Theo host** để giữ đúng tham số
 `--max-width` lúc host khởi động. Với H.264, host tạo lại encoder và client
-tạo lại decoder tương ứng.
+tạo lại decoder tương ứng. Góc phải dưới hiện kích thước frame đang nhận.
 
 ## 6. Nếu bật UFW trên Kubuntu
 
