@@ -83,14 +83,14 @@ TARGETS: dict[str, Target] = {
         entry=ROOT / "host.py",
         name="remote-host",
         windowed=False,
-        platforms={"linux"},
+        platforms={"linux", "windows"},
         requires={"mss", "pynput"},
     ),
     "host-gui": Target(
         entry=ROOT / "host_gui.py",
         name="remote-host-gui",
         windowed=True,
-        platforms={"linux"},
+        platforms={"linux", "windows"},
         requires={"mss", "pynput"},
     ),
 }

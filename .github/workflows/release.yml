@@ -21,7 +21,7 @@ jobs:
           - os: ubuntu-latest
             targets: client host host-gui
           - os: windows-latest
-            targets: client
+            targets: client host host-gui
     steps:
       - uses: actions/checkout@v4
         with:

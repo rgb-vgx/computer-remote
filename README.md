@@ -4,8 +4,8 @@ Một bản **MVP remote desktop bằng Python** viết để **học nguyên l�
 host chụp màn hình → stream JPEG qua TCP → client hiển thị; client bắt mouse →
 gửi event về host → host inject vào desktop.
 
-- **Host / remote**: Kubuntu (X11). Chụp màn hình + nhận input.
-- **Client / viewer**: Windows. Hiển thị + điều khiển chuột.
+- **Host / remote**: Kubuntu (X11) **hoặc Windows 10/11**. Chụp màn hình + nhận input.
+- **Client / viewer**: Windows **hoặc Linux**. Hiển thị + điều khiển chuột/bàn phím.
 - Kết nối điểm-điểm qua **Tailscale** (`100.x.y.z:7777`).
 
 ---
@@ -20,12 +20,13 @@ gửi event về host → host inject vào desktop.
   Không có TLS ở tầng ứng dụng vì đã dựa vào Tailscale lo phần mã hoá.
 - **Không chạy nếu bạn chưa hiểu rủi ro của remote control.** Người cầm client
   điều khiển được chuột máy host.
-- App **chạy foreground, log rõ ràng, không tự khởi động, không chạy ẩn, không
-  persistence, không keylogger.** Muốn dừng: đóng cửa sổ / Ctrl+C.
+- App **chạy foreground, log rõ ràng, không chạy ẩn, không persistence, không
+  keylogger** — chỉ tự khởi động nếu bạn tự bật option *Khởi động cùng hệ thống*
+  trong GUI. Muốn dừng: đóng cửa sổ / Ctrl+C.
 
 ---
 
-## 1. Cài đặt trên Kubuntu (HOST)
+## 1. Cài đặt trên Kubuntu (HOST Linux)
 
 ```bash
 sudo apt update
@@ -39,7 +40,7 @@ pip install -r requirements.txt
 > **Plasma (X11)** ở màn hình đăng nhập). Mở **Konsole** từ trong desktop đó.
 > Không chạy qua SSH/TTY và không dùng Wayland.
 
-## 2. Cài đặt trên Windows (CLIENT)
+## 2. Cài đặt trên Windows (CLIENT hoặc HOST)
 
 ```powershell
 py -m venv .venv
@@ -47,10 +48,21 @@ py -m venv .venv
 pip install -r requirements.txt
 ```
 
-## 3. Chạy HOST (Kubuntu)
+> Windows cũng chạy được **host** (`host_gui.py` / `host.py`) — capture qua GDI,
+> input qua pynput, không cần X11. H.264 cần `ffmpeg` (thêm vào PATH).
+
+## 3. Chạy HOST
+
+Linux (CLI):
 
 ```bash
-python host.py --bind 0.0.0.0 --port 7777 --token "change-me" --fps 8 --quality 60
+python host.py --bind 0.0.0.0 --port 7777 --token "change-me" --fps 15 --quality 75
+```
+
+Windows (GUI — khuyến nghị) hoặc Linux (GUI/tray):
+
+```bash
+python host_gui.py --token "change-me"
 ```
 
 Tham số:
@@ -71,7 +83,7 @@ Tham số:
 tailscale ip -4
 ```
 
-## 5. Chạy CLIENT (Windows)
+## 5. Chạy CLIENT (Windows hoặc Linux)
 
 ```powershell
 python client.py
@@ -143,7 +155,7 @@ echo $DISPLAY                 # không được rỗng (vd ':0')
 ## 8. Kiến trúc (tóm tắt)
 
 ```
-        Kubuntu HOST                              Windows CLIENT
+        HOST (Linux X11 / Windows)                CLIENT (Windows/Linux)
    ┌────────────────────┐                    ┌──────────────────────┐
    │ mss.grab màn hình  │                    │  PySide6 GUI          │
    │   ↓                │   TCP (Tailscale)  │   RemoteView (QLabel) │
@@ -151,8 +163,8 @@ echo $DISPLAY                 # không được rỗng (vd ':0')
    │   ↓ send_packet    │                    │                       │
    │ [capture thread]   │                    │  bắt mouse → normalize│
    │                    │ ◄ control (type 2)─── (0..1)  [NetworkWorker│
-   │ pynput inject      │                    │            QThread]   │
-   │ [control thread]   │   hello (type 3)   │                       │
+   │ inject (XTEST/     │                    │            QThread]   │
+   │  pynput)           │   hello (type 3)   │                       │
    └────────────────────┘   info  (type 4)   └──────────────────────┘
 ```
 
@@ -185,15 +197,15 @@ Kết quả: `dist/<target>/` (chạy trực tiếp) và
 
 | Target | OS | File chạy |
 |---|---|---|
-| `remote-host` | Linux | `remote-host` (CLI) |
-| `remote-host-gui` | Linux | `remote-host-gui` (GUI/tray) |
+| `remote-host` | Linux, Windows | `remote-host` / `remote-host.exe` (CLI) |
+| `remote-host-gui` | Linux, Windows | `remote-host-gui` / `remote-host-gui.exe` (GUI/tray) |
 | `remote-client` | Linux, Windows | `remote-client` / `remote-client.exe` |
 
 ### Release tự động qua GitHub Actions
 
 Push tag `v*` → workflow `.github/workflows/release.yml` build trên
-`ubuntu-latest` (host + client) và `windows-latest` (client), rồi tạo GitHub
-Release kèm tất cả file:
+`ubuntu-latest` và `windows-latest` (cả host + client cho từng OS), rồi tạo
+GitHub Release kèm tất cả file:
 
 ```bash
 git tag v0.1.0
@@ -235,7 +247,8 @@ cần cài tay một lần, sau đó update trong app.
 ## 10. Giới hạn của bản MVP
 
 - Chỉ **1 client** tại một thời điểm.
-- Chỉ **X11** (không Wayland — cố ý không bypass quyền OS).
+- Host Linux chỉ **X11** (không Wayland — cố ý không bypass quyền OS);
+  host Windows không cần X11.
 - Codec **JPEG từng frame** mặc định (H.264 cần ffmpeg, giảm băng thông
   nhưng thêm 1–2 frame delay do decode).
 - Chỉ **mouse** (move / click trái, phải / scroll) và **keyboard** (ký tự,
