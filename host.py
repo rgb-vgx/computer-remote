@@ -161,30 +161,22 @@ _KEY_NAME_TO_KEYSYM = {
 for _i in range(1, 13):
     _KEY_NAME_TO_KEYSYM[f"f{_i}"] = 0xFFBE + _i - 1
 
-# Keysym của phím modifier → bit trong event.state.
-_MOD_KEYSYM_TO_MASK = {
-    0xFFE1: 0x01, 0xFFE2: 0x01,   # Shift
-    0xFFE3: 0x04, 0xFFE4: 0x04,   # Control
-    0xFFE9: 0x08, 0xFFEA: 0x08,   # Alt (Mod1)
-    0xFFEB: 0x40, 0xFFEC: 0x40,   # Super (Mod4)
-    0xFE03: 0x80,                 # ISO_Level3_Shift (Mod5/AltGr)
-}
-
 
 class X11Keyboard:
-    """Inject bàn phím bằng XSendEvent.
+    """Inject bàn phím qua XTEST (cùng cách xdotool).
 
-    pynput dùng XTEST cho phím đặc biệt, nhưng event XTEST không tới được
-    app trên setup này (Qt bỏ qua), trong khi XSendEvent tới đều. Modifier
-    (shift/ctrl/alt/cmd/alt_gr) phải track thủ công vì XSendEvent không
-    cập nhật state của X server.
+    XTEST hoạt động với mọi app: Qt/KDE, GTK, terminal, và cả
+    Electron/Chromium (VS Code) — trong khi XSendEvent bị Chromium bỏ qua.
+    Ký tự cần Shift/AltGr được bọc bằng phím modifier tạm thời (nếu
+    modifier đó chưa được giữ).
     """
 
     def __init__(self) -> None:
         from Xlib import display
+        from Xlib.ext import xtest
         self._display = display.Display()
+        self._xtest = xtest
         self._lock = threading.Lock()
-        self._mods = 0
 
     def press(self, key: str) -> None:
         with self._lock:
@@ -202,19 +194,8 @@ class X11Keyboard:
             return ord(name)
         return None
 
-    def _state_for(self, keysym: int) -> int:
-        """Mask Shift/AltGr cần thiết để gõ ra keysym này."""
-        keycode = self._display.keysym_to_keycode(keysym)
-        if not keycode:
-            return 0
-        for index, mask in ((1, 0x01), (2, 0x80), (3, 0x81)):
-            if self._display.keycode_to_keysym(keycode, index) == keysym:
-                return mask
-        return 0
-
     def _inject(self, key: str, is_press: bool) -> None:
         from Xlib import X
-        from Xlib.display import event as xevent
 
         keysym = self._keysym(key)
         if keysym is None:
@@ -225,24 +206,30 @@ class X11Keyboard:
             log.warning("Không map được phím %r trên layout hiện tại", key)
             return
 
-        is_mod = keysym in _MOD_KEYSYM_TO_MASK
-        state = self._mods if is_mod else self._mods | self._state_for(keysym)
-        focus = self._display.get_input_focus().focus
-        event = (xevent.KeyPress if is_press else xevent.KeyRelease)(
-            detail=keycode, state=state, time=0,
-            root=self._display.screen().root, window=focus,
-            same_screen=0, child=X.NONE,
-            root_x=0, root_y=0, event_x=0, event_y=0)
-        if hasattr(focus, "send_event"):
-            focus.send_event(event)
-        else:
-            self._display.send_event(focus, event)
-        self._display.sync()
+        shift_kc = self._display.keysym_to_keycode(0xFFE1)   # Shift_L
+        altgr_kc = self._display.keysym_to_keycode(0xFE03)   # ISO_Level3_Shift
+        need_shift = need_altgr = False
+        if self._display.keycode_to_keysym(keycode, 0) != keysym:
+            for index, shift, altgr in ((1, True, False), (2, False, True),
+                                        (3, True, True)):
+                if self._display.keycode_to_keysym(keycode, index) == keysym:
+                    need_shift, need_altgr = shift, altgr
+                    break
+        mods = self._display.screen().root.query_pointer().mask
+        press_shift = need_shift and not (mods & X.ShiftMask)
+        press_altgr = need_altgr and not (mods & 0x80)
 
-        if is_mod:
-            mask = _MOD_KEYSYM_TO_MASK[keysym]
-            self._mods = ((self._mods | mask) if is_press
-                          else (self._mods & ~mask))
+        if press_shift:
+            self._xtest.fake_input(self._display, X.KeyPress, shift_kc)
+        if press_altgr:
+            self._xtest.fake_input(self._display, X.KeyPress, altgr_kc)
+        self._xtest.fake_input(
+            self._display, X.KeyPress if is_press else X.KeyRelease, keycode)
+        if press_altgr:
+            self._xtest.fake_input(self._display, X.KeyRelease, altgr_kc)
+        if press_shift:
+            self._xtest.fake_input(self._display, X.KeyRelease, shift_kc)
+        self._display.sync()
 
 
 # ---------------------------------------------------------------------------
