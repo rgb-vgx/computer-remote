@@ -1,0 +1,5 @@
+# Dev dependencies: chạy pytest + ruff (CI).
+-r requirements.txt
+
+pytest
+ruff

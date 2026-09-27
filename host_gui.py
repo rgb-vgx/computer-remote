@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 from common import app_log_dir
 from common.updater import current_version
 from common.updater_qt import UpdateController
-from host import HostServer, detect_display
+from host import HostServer, detect_display, warn_weak_config
 
 log = logging.getLogger("host_gui")
 
@@ -517,6 +517,7 @@ def main() -> int:
     log.info("=== Remote Desktop Host (GUI mode) ===")
     log.info("Bind: %s:%d | FPS: %d | Quality: %d | Max-width: %d",
              args.bind, args.port, args.fps, args.quality, args.max_width)
+    warn_weak_config(args.bind, args.token)
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)

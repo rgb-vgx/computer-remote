@@ -10,6 +10,7 @@ Chạy:
 from __future__ import annotations
 
 import argparse
+import hmac
 import logging
 import os
 import queue
@@ -29,6 +30,10 @@ import numpy as np
 from common import app_log_dir, protocol
 
 log = logging.getLogger("host")
+
+# Chống dò token: khóa IP tạm thời sau N lần sai.
+_AUTH_MAX_FAILURES = 5
+_AUTH_BLOCK_SECONDS = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +368,10 @@ class HostServer:
         self.on_client_disconnected = None
         self._client_stop: threading.Event | None = None
         self._client_sock: socket.socket | None = None
+        # Auth: đếm lần sai / khóa tạm theo IP.
+        self._auth_failures: dict[str, int] = {}
+        self._auth_blocked_until: dict[str, float] = {}
+        self._auth_lock = threading.Lock()
 
     def _notify(self, callback, *args) -> None:
         if callback is None:
@@ -427,6 +436,10 @@ class HostServer:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
+        # Đăng ký sớm để GUI có thể "ngắt client" cả khi đang xác thực.
+        client_stop = threading.Event()
+        self._client_stop = client_stop
+        self._client_sock = sock
         ptype, payload = protocol.recv_packet(sock)
         if ptype != protocol.PKT_HELLO:
             log.warning("Client %s gửi packet không phải hello", addr)
@@ -437,8 +450,30 @@ class HostServer:
             log.warning("Hello không phải JSON hợp lệ")
             return
 
-        if hello.get("token") != self.args.token:
-            log.warning("AUTH FAIL từ %s", addr)
+        ip = addr[0]
+        now = time.time()
+        with self._auth_lock:
+            blocked_until = self._auth_blocked_until.get(ip, 0.0)
+        if now < blocked_until:
+            log.warning("AUTH BLOCKED từ %s (còn %.0fs)", addr, blocked_until - now)
+            try:
+                protocol.send_json(sock, protocol.PKT_INFO,
+                                   {"type": "error",
+                                    "message": "too many attempts, thử lại sau"})
+            except OSError:
+                pass
+            return
+
+        if not _token_matches(hello.get("token"), self.args.token):
+            with self._auth_lock:
+                failures = self._auth_failures.get(ip, 0) + 1
+                self._auth_failures[ip] = failures
+                if failures >= _AUTH_MAX_FAILURES:
+                    self._auth_blocked_until[ip] = now + _AUTH_BLOCK_SECONDS
+                    self._auth_failures[ip] = 0
+                    log.warning("AUTH BLOCK %s sau %d lần sai (%.0fs)",
+                                addr, failures, _AUTH_BLOCK_SECONDS)
+            log.warning("AUTH FAIL từ %s (lần %d)", addr, failures)
             try:
                 protocol.send_json(sock, protocol.PKT_INFO,
                                    {"type": "error", "message": "auth failed"})
@@ -446,7 +481,12 @@ class HostServer:
                 pass
             return
 
+        with self._auth_lock:
+            self._auth_failures.pop(ip, None)
         log.info("AUTH SUCCESS từ %s", addr)
+        if client_stop.is_set():
+            log.info("Client %s bị ngắt trong lúc xác thực", addr)
+            return
         protocol.send_json(sock, protocol.PKT_INFO,
                            {"type": "info", "message": "auth ok"})
 
@@ -455,9 +495,6 @@ class HostServer:
         self._client_supports_h264 = "h264" in client_codecs
 
         sock.settimeout(None)
-        client_stop = threading.Event()
-        self._client_stop = client_stop
-        self._client_sock = sock
 
         send_thread = threading.Thread(
             target=self._capture_loop, args=(sock, client_stop),
@@ -876,6 +913,25 @@ def _safe_close(sock) -> None:
         pass
 
 
+def _token_matches(given, expected: str) -> bool:
+    """So token bằng compare_digest để tránh timing attack."""
+    if not isinstance(given, str):
+        return False
+    return hmac.compare_digest(given.encode("utf-8", "replace"),
+                               expected.encode("utf-8", "replace"))
+
+
+def warn_weak_config(bind: str, token: str) -> None:
+    """Cảnh báo cấu hình dễ bị tấn công (bind mở, token yếu)."""
+    if bind in ("0.0.0.0", "::"):
+        log.warning("=" * 64)
+        log.warning("CẢNH BÁO: bind %s = mở trên MỌI interface (LAN/Internet).", bind)
+        log.warning("Nên --bind <IP Tailscale> hoặc chặn firewall (README mục 6).")
+        log.warning("=" * 64)
+    if len(token) < 6:
+        log.warning("Token yếu (< 6 ký tự) — chỉ nên dùng trong tailnet.")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -922,6 +978,7 @@ def main() -> int:
     log.info("=== Remote desktop HOST ===")
     log.info("Token: %s | Codec: %s", args.token, args.codec)
     check_display_env()
+    warn_weak_config(args.bind, args.token)
     if args.view_only:
         log.info("--view-only: bỏ qua control.")
 

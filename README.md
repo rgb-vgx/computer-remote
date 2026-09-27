@@ -241,17 +241,32 @@ cần cài tay một lần, sau đó update trong app.
 - Chỉ **mouse** (move / click trái, phải / scroll) và **keyboard** (ký tự,
   phím đặc biệt, modifier). Chưa hỗ trợ dead-key / IME phức tạp.
 - Clipboard chỉ text; không multi-monitor, không audio, không file transfer.
-- Token đơn giản, không TLS tầng ứng dụng (dựa vào Tailscale).
+- Token đơn giản (đã so constant-time + khóa IP sau 5 lần sai), không TLS
+  tầng ứng dụng (dựa vào Tailscale).
 
 ---
 
-## 11. Roadmap nâng cấp
+## 11. Phát triển & kiểm thử
+
+```bash
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+ruff check .        # lint
+pytest              # unit/integration tests
+```
+
+CI chạy lint + test trên mỗi push/PR (`.github/workflows/tests.yml`);
+release workflow còn chạy smoke test cài đặt updater trên cả Linux/Windows.
+
+---
+
+## 12. Roadmap nâng cấp
 
 1. **Video codec**: encode/decode trong process (PyAV) hoặc hardware
    (VAAPI/NVENC) để giảm latency và CPU.
 2. **Clipboard ảnh/file**, dead-key / IME.
 3. **Multi-monitor**: chọn / chuyển màn hình.
-4. **Reconnect** tự động khi rớt mạng.
-5. **Auth tốt hơn**: challenge-response, key trao đổi, rate-limit.
+4. **Dirty-rectangle/XDamage** + adaptive fps/quality theo băng thông.
+5. **Auth tốt hơn**: challenge-response, key trao đổi (đã có rate-limit).
 6. **Transport**: QUIC / WebRTC (NAT traversal, độ trễ thấp).
 7. **Port C++/Qt** sau khi bản Python chạy ổn định (hiệu năng capture/encode).
