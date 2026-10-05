@@ -86,15 +86,18 @@ class H264Decoder:
         while not self._closed and self._proc.poll() is None:
             try:
                 if nonblocking:
-                    chunk = os.read(fd, 65536)
+                    chunk = os.read(fd, 262144)
                 else:
-                    chunk = self._proc.stdout.read1(65536)
+                    chunk = self._proc.stdout.read1(262144)
                 if not chunk:
                     break
                 with self._lock:
                     self._buf += chunk
             except BlockingIOError:
-                time.sleep(0.01)
+                # 1ms (không phải 10ms): EAGAIN là "chưa có byte tới" —
+                # wake sớm để kịp nhận frame khi pipe vừa có dữ liệu;
+                # 10ms thêm độ trễ thấy rõ cho feed -> frame-ready.
+                time.sleep(0.001)
             except Exception:
                 break
 
@@ -216,6 +219,9 @@ class NetworkWorker(QThread):
         self._h264_dec: H264Decoder | None = None
         self._frame_w = 0
         self._frame_h = 0
+        # generation encoder của host: bỏ packet codec cũ đến trễ (defense-in-depth,
+        # TCP đã thứ tự hóa — client chỉ bảo vệ khi reconnect/re-negotiate).
+        self._codec_generation = 0
 
     def stop(self) -> None:
         self._running = False
@@ -300,34 +306,7 @@ class NetworkWorker(QThread):
                     self.rejected.emit(f"Host từ chối: {msg}")
                     return
                 elif info.get("type") == "codec":
-                    c = info.get("codec", "")
-                    if c == "h264":
-                        w = info.get("width", 0)
-                        h = info.get("height", 0)
-                        if w and h:
-                            # Codec info gửi lại khi host đổi độ phân giải →
-                            # tạo lại decoder cho kích thước mới.
-                            if self._h264_dec is not None:
-                                self._h264_dec.close()
-                                self._h264_dec = None
-                            self._frame_w = w
-                            self._frame_h = h
-                            if H264Decoder.available():
-                                try:
-                                    self._h264_dec = H264Decoder(w, h)
-                                    log.info("H.264 decoder ready (%dx%d)", w, h)
-                                except Exception:
-                                    log.warning("H.264 decoder init fail, yêu cầu host dùng JPEG")
-                                    self.send_control({
-                                        "event": "codec_request",
-                                        "codec": "jpeg",
-                                    })
-                            else:
-                                log.warning("ffmpeg not found, yêu cầu host dùng JPEG")
-                                self.send_control({
-                                    "event": "codec_request",
-                                    "codec": "jpeg",
-                                })
+                    self._handle_codec_info(info)
                     continue
                 elif info.get("type") == "monitors":
                     self.monitors_ready.emit(
@@ -339,6 +318,52 @@ class NetworkWorker(QThread):
                 log.info("Kết nối thành công — %s", msg)
                 self.status.emit(f"Đã kết nối — {msg}")
                 self.connected.emit()
+
+    def _handle_codec_info(self, info: dict) -> None:
+        """Nhận packet {type: codec}: bỏ packet cũ (generation), dựng decoder.
+
+        Packet có ``generation`` (host mới): bỏ nếu đã nhận generation ≥ nó
+        (đến trễ sau khi network giật). Host cũ không gửi → xử lý như trước.
+        """
+        gen = info.get("generation")
+        if gen is not None:
+            try:
+                gen = int(gen)
+            except (TypeError, ValueError):
+                gen = None
+        if gen is not None:
+            if gen <= self._codec_generation:
+                return  # packet codec cũ (tạo lại trước đó) — bỏ
+            self._codec_generation = gen
+        if info.get("codec", "") != "h264":
+            return
+        w = info.get("width", 0)
+        h = info.get("height", 0)
+        if not (w and h):
+            return
+        # Codec info gửi lại khi host đổi độ phân giải → tạo lại decoder
+        # cho kích thước mới.
+        if self._h264_dec is not None:
+            self._h264_dec.close()
+            self._h264_dec = None
+        self._frame_w = w
+        self._frame_h = h
+        if H264Decoder.available():
+            try:
+                self._h264_dec = H264Decoder(w, h)
+                log.info("H.264 decoder ready (%dx%d)", w, h)
+            except Exception:
+                log.warning("H.264 decoder init fail, yêu cầu host dùng JPEG")
+                self.send_control({
+                    "event": "codec_request",
+                    "codec": "jpeg",
+                })
+        else:
+            log.warning("ffmpeg not found, yêu cầu host dùng JPEG")
+            self.send_control({
+                "event": "codec_request",
+                "codec": "jpeg",
+            })
 
     def _flush_control(self) -> None:
         assert self._sock is not None
@@ -367,13 +392,31 @@ class NetworkWorker(QThread):
         if self._h264_dec is None:
             return
         self._h264_dec.feed(payload)
+        # Poll ngắn ~3ms sau feed: decode thường xong trong vài ms — nếu frame
+        # ready thì paint NGAY packet này. Gọi read đúng 1 lần như cũ gần như
+        # luôn trả None → frame phải chờ packet kế tiếp (+1 period =
+        # 33–66ms @15–30fps) → lag thấy rõ so với JPEG (decode inline).
+        deadline = time.perf_counter() + 0.003
         img = self._h264_dec.read_frame()
-        if img is not None:
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            h, w = self._frame_h, self._frame_w
-            qimg = QImage(img_rgb.data, w, h, 3 * w,
-                          QImage.Format_RGB888).copy()
-            self.frame_ready.emit(qimg)
+        while img is None and time.perf_counter() < deadline:
+            time.sleep(0.0005)
+            img = self._h264_dec.read_frame()
+        if img is None:
+            return
+        # Drain-to-latest: mỗi packet có thể để lại nhiều frame đã decode —
+        # đọc hết và chỉ paint frame MỚI NHẤT. Nếu chỉ đọc 1 frame/packet mà
+        # decoder chậm hơn network thì backlog tích lùi, lag tăng vô hạn
+        # (~67ms/frame tồn đọng @15fps).
+        while True:
+            nxt = self._h264_dec.read_frame()
+            if nxt is None:
+                break
+            img = nxt
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        h, w = self._frame_h, self._frame_w
+        qimg = QImage(img_rgb.data, w, h, 3 * w,
+                      QImage.Format_RGB888).copy()
+        self.frame_ready.emit(qimg)
 
     def _handle_control(self, payload: bytes) -> None:
         try:
@@ -393,6 +436,8 @@ class NetworkWorker(QThread):
 class RemoteView(QLabel):
     mouse_event = Signal(dict)
     key_event = Signal(dict)
+    # Báo MainWindow: vùng hiển thị đổi kích thước (dùng cho độ phân giải Tự động)
+    view_resized = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -405,18 +450,24 @@ class RemoteView(QLabel):
         # Cho phép IME (bộ gõ tiếng Việt/CJK) commit text vào widget này.
         self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
 
+        # Invariant B0: _frame = frame host gửi, kích thước PIXEL THẬT (physical);
+        # dpr chỉ dùng để Qt map physical -> logical khi vẽ.
+        self._frame: QImage | None = None
         self._pixmap: QPixmap | None = None
-        self._draw_rect = (0, 0, 0, 0)
+        self._draw_rect = (0.0, 0.0, 0.0, 0.0)
         self._scroll_acc = [0, 0]
 
     def set_frame(self, qimg: QImage) -> None:
-        self._pixmap = QPixmap.fromImage(qimg)
+        self._frame = qimg
         self.setText("")
         self._rescale()
         self.update()
-        self.setFocus()
+        # Không setFocus() ở đây: mỗi frame (~15/s) sẽ cướp focus khi user
+        # đang gõ ở form (token, độ phân giải). Focus sang view khi Connect
+        # (_connect) hoặc click vào vùng xem (mousePressEvent).
 
     def clear_frame(self, text: str) -> None:
+        self._frame = None
         self._pixmap = None
         self.setPixmap(QPixmap())
         self.setText(text)
@@ -424,17 +475,41 @@ class RemoteView(QLabel):
     def resizeEvent(self, event) -> None:
         self._rescale()
         super().resizeEvent(event)
+        self.view_resized.emit()
 
     def _rescale(self) -> None:
-        if self._pixmap is None:
+        """Scale frame vào vùng hiển thị theo physical pixel.
+
+        - Frame == kích thước physical của view -> render 1:1, KHÔNG resample
+          (nét tối đa, đúng mục tiêu "như AnyDesk").
+        - Khác -> SmoothTransformation (bilinear), KHÔNG dùng FastTransformation
+          (nearest neighbor đang bỏ ~50% pixel khi co 1.8x).
+        - QPixmap mang dpr của view để QLabel vẽ đúng logical size, tránh
+          scale hai lần trên màn hình HiDPI.
+        """
+        if self._frame is None:
             return
-        area = self.size()
-        scaled = self._pixmap.scaled(
-            area, Qt.KeepAspectRatio, Qt.FastTransformation)
-        x = (area.width() - scaled.width()) // 2
-        y = (area.height() - scaled.height()) // 2
-        self._draw_rect = (x, y, scaled.width(), scaled.height())
-        self.setPixmap(scaled)
+        dpr = self.devicePixelRatioF() or 1.0
+        fw, fh = self._frame.width(), self._frame.height()
+        vw, vh = self.width() * dpr, self.height() * dpr
+        if fw <= 0 or fh <= 0 or vw <= 0 or vh <= 0:
+            return
+        scale = min(vw / fw, vh / fh)
+        if 0.995 < scale < 1.005:
+            img = self._frame  # 1:1 physical — bỏ qua resample
+        else:
+            img = self._frame.scaled(
+                max(1, round(fw * scale)), max(1, round(fh * scale)),
+                Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        disp = QImage(img)  # copy chia sẻ pixel (COW) — chỉ đổi metadata dpr
+        disp.setDevicePixelRatio(dpr)
+        self._pixmap = QPixmap.fromImage(disp)
+        # _draw_rect theo logical để toạ độ chuột (logical) khớp khi map.
+        lw = self._pixmap.width() / dpr
+        lh = self._pixmap.height() / dpr
+        self._draw_rect = ((self.width() - lw) / 2, (self.height() - lh) / 2,
+                           lw, lh)
+        self.setPixmap(self._pixmap)
 
     def _normalized(self, pos) -> tuple[float, float] | None:
         if self._pixmap is None:
@@ -531,6 +606,10 @@ class RemoteView(QLabel):
 # Main window
 # ---------------------------------------------------------------------------
 
+# itemData sentinel của combo "Độ phân giải" cho chế độ tự động (fit cửa sổ).
+RES_AUTO = "auto"
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -558,6 +637,7 @@ class MainWindow(QMainWindow):
         self.res_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.res_combo.lineEdit().setValidator(
             QIntValidator(160, 7680, self.res_combo))
+        self.res_combo.addItem("Tự động (vừa cửa sổ)", RES_AUTO)
         self.res_combo.addItem("Theo host", None)
         for label, width in (
             ("3840 (4K UHD)", 3840), ("2560 (QHD)", 2560),
@@ -570,10 +650,11 @@ class MainWindow(QMainWindow):
             self.res_combo.addItem(label, width)
         self.res_combo.setCurrentIndex(0)
         self.res_combo.setToolTip(
-            "Độ phân giải stream tối đa (max-width, 160–7680).\n"
-            "Thấp hơn = mượt hơn, ít băng thông hơn.\n"
-            "'Theo host' = giữ nguyên tham số --max-width của host.\n"
-            "Có thể gõ số tùy ý.")
+            "Độ phân giải stream (max-width, 160–7680).\n"
+            "'Tự động' (mặc định): stream khớp đúng kích thước cửa sổ này,\n"
+            "  hiển thị 1:1 pixel — nét nhất, ít băng thông nhất (như AnyDesk).\n"
+            "'Theo host': giữ nguyên tham số --max-width của host.\n"
+            "Thấp hơn = mượt hơn, ít băng thông hơn. Có thể gõ số tùy ý.")
         self.res_combo.currentIndexChanged.connect(self._on_resolution_changed)
         self.res_combo.lineEdit().editingFinished.connect(
             self._on_resolution_edited)
@@ -603,6 +684,10 @@ class MainWindow(QMainWindow):
         self.view = RemoteView()
         self.view.mouse_event.connect(self._on_mouse_event)
         self.view.key_event.connect(self._on_key_event)
+        self.view.view_resized.connect(self._on_view_resized)
+        # Danh sách monitor host (nhận khi kết nối) — dùng cho chế độ Tự động.
+        self._monitors: list[dict] = []
+        self._monitor_current = 1
         self.status_label = QLabel("Trạng thái: Disconnected")
         self.status_label.setStyleSheet("padding: 4px;")
         self.status_label.setTextInteractionFlags(
@@ -632,6 +717,12 @@ class MainWindow(QMainWindow):
         self._reconnect_timer = QTimer(self)
         self._reconnect_timer.setSingleShot(True)
         self._reconnect_timer.timeout.connect(self._reconnect_now)
+        # Debounce cho độ phân giải Tự động: gộp loạt resize trong 200ms thành
+        # 1 lệnh set_resolution (host không phải tạo lại encoder liên tục).
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setSingleShot(True)
+        self._auto_timer.setInterval(200)
+        self._auto_timer.timeout.connect(self._send_resolution)
         self._restore_settings()
 
     # ---- Settings --------------------------------------------------------
@@ -644,13 +735,31 @@ class MainWindow(QMainWindow):
         token = self.settings.value("token", "", str)
         if token:
             self.token_edit.setText(token)
-        resolution = self.settings.value("resolution", "", str)
-        if resolution:
-            index = self.res_combo.findText(resolution)
-            if index >= 0:
-                self.res_combo.setCurrentIndex(index)
+        mode = self.settings.value("resolution_mode", "", str)
+        if mode in ("auto", "host", "manual"):
+            if mode == "auto":
+                self.res_combo.setCurrentIndex(self.res_combo.findData(RES_AUTO))
+            elif mode == "host":
+                self.res_combo.setCurrentIndex(self.res_combo.findText("Theo host"))
             else:
-                self.res_combo.setEditText(resolution)
+                try:
+                    width = int(self.settings.value("manual_width", 1920))
+                except (TypeError, ValueError):
+                    width = 1920
+                index = self.res_combo.findData(width)
+                if index >= 0:
+                    self.res_combo.setCurrentIndex(index)
+                else:
+                    self.res_combo.setEditText(str(max(160, min(7680, width))))
+        else:
+            # Cài đặt của bản cũ: lưu theo nhãn text.
+            resolution = self.settings.value("resolution", "", str)
+            if resolution:
+                index = self.res_combo.findText(resolution)
+                if index >= 0:
+                    self.res_combo.setCurrentIndex(index)
+                else:
+                    self.res_combo.setEditText(resolution)
         geometry = self.settings.value("geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
@@ -659,6 +768,11 @@ class MainWindow(QMainWindow):
         self.settings.setValue("host", self.host_edit.text().strip())
         self.settings.setValue("port", self.port_edit.text().strip())
         self.settings.setValue("token", self.token_edit.text())
+        self.settings.setValue("resolution_mode", self._resolution_mode())
+        if self._resolution_mode() == "manual":
+            width = self._selected_width()
+            if width is not None:
+                self.settings.setValue("manual_width", width)
         self.settings.setValue("resolution", self.res_combo.currentText())
         self.settings.setValue("geometry", self.saveGeometry())
 
@@ -672,7 +786,13 @@ class MainWindow(QMainWindow):
         self.updater.start()
 
     def _selected_width(self) -> int | None:
-        """Width đang chọn: None = 'Theo host', số = max-width cụ thể."""
+        """Width đang chọn: None = 'Theo host'/không phải số, số = max-width.
+
+        Chế độ Tự động không có width tĩnh — kiểm tra ``_resolution_mode()``
+        trước khi gọi hàm này.
+        """
+        if self.res_combo.currentData() == RES_AUTO:
+            return None
         text = self.res_combo.currentText().strip()
         if not text or text.lower().startswith("theo"):
             return None
@@ -681,12 +801,69 @@ class MainWindow(QMainWindow):
             return None
         return max(160, min(7680, int(first)))
 
+    def _resolution_mode(self) -> str:
+        """auto | host | manual — theo lựa chọn hiện tại của combo."""
+        if self.res_combo.currentData() == RES_AUTO:
+            return "auto"
+        if self._selected_width() is None:
+            return "host"
+        return "manual"
+
+    def _selected_monitor_size(self) -> tuple[int, int] | None:
+        """(width, height) của monitor đang chọn; None = chưa nhận được."""
+        if not self._monitors:
+            return None
+        index = self.monitor_combo.currentData() or self._monitor_current
+        for mon in self._monitors:
+            if mon.get("index") == index:
+                width, height = int(mon.get("width") or 0), int(mon.get("height") or 0)
+                if width > 0 and height > 0:
+                    return width, height
+        return None
+
+    def _auto_width(self) -> int | None:
+        """Tính max-width cho chế độ Tự động (contain-fit, không upscale).
+
+        - ``scale = min(view/monitor, view_h/monitor_h, 1.0)`` → width yêu cầu
+          không bao giờ vượt monitor (host không upscale; client tự fill view).
+        - Theo **physical pixel** (view × devicePixelRatio) để hiển thị 1:1.
+        - Quantize bucket 8px: DPR fractional (1.25/1.5) không gây đổi width
+          liên tục mỗi lần resize 1px (tránh host tạo lại encoder).
+        """
+        dpr = self.view.devicePixelRatioF() or 1.0
+        view_w = self.view.width() * dpr
+        view_h = self.view.height() * dpr
+        if view_w <= 0 or view_h <= 0:
+            return None
+        mon = self._selected_monitor_size()
+        if mon is not None:
+            mon_w, mon_h = mon
+            scale = min(view_w / mon_w, view_h / mon_h, 1.0)
+            width = mon_w * scale
+        else:
+            width = min(view_w, view_h * 16 / 9)  # chưa có monitor → giả định 16:9
+        # +1e-6 chống lỗi làm tròn fp (800/1920*1920 có thể ra 799.9999...)
+        width = int(width + 1e-6) // 8 * 8
+        return max(160, min(7680, int(width)))
+
     def _send_resolution(self) -> None:
-        if self.worker is not None:
-            self.worker.send_control(
-                {"event": "set_resolution", "max_width": self._selected_width()})
+        if self.worker is None:
+            return
+        mode = self._resolution_mode()
+        if mode == "auto":
+            width = self._auto_width()
+            if width is None:
+                return
+        elif mode == "manual":
+            width = self._selected_width()
+            if width is None:
+                return
+        else:
+            width = None  # 'Theo host' → host quay về --max-width lúc khởi động
+        self.worker.send_control({"event": "set_resolution", "max_width": width})
 
     def _on_resolution_changed(self, _index: int = -1) -> None:
+        self._auto_timer.stop()
         self._send_resolution()
 
     def _on_resolution_edited(self) -> None:
@@ -697,7 +874,15 @@ class MainWindow(QMainWindow):
                 self.res_combo.setEditText(str(width))
         self._send_resolution()
 
+    def _on_view_resized(self) -> None:
+        """Cửa sổ đổi size → gộp loạt resize rồi gửi 1 lần (debounce 200ms)."""
+        if self.worker is None or self._resolution_mode() != "auto":
+            return
+        self._auto_timer.start()
+
     def _on_monitors_ready(self, monitors: list, current: int) -> None:
+        self._monitors = list(monitors)
+        self._monitor_current = int(current or 1)
         self.monitor_combo.blockSignals(True)
         self.monitor_combo.clear()
         self.monitor_combo.addItem("Theo host", None)
@@ -710,6 +895,9 @@ class MainWindow(QMainWindow):
         index = self.monitor_combo.findData(current)
         self.monitor_combo.setCurrentIndex(index if index > 0 else 0)
         self.monitor_combo.blockSignals(False)
+        # Mới biết tỉ lệ monitor → tính lại width auto (nếu đang bật).
+        if self.worker is not None and self._resolution_mode() == "auto":
+            self._send_resolution()
 
     def _on_monitor_changed(self, index: int) -> None:
         if self.worker is None:
@@ -717,8 +905,12 @@ class MainWindow(QMainWindow):
         data = self.monitor_combo.itemData(index)
         self.worker.send_control({"event": "set_monitor",
                                   "index": int(data or 1)})
+        if self._resolution_mode() == "auto":
+            # Monitor khác tỉ lệ → tính lại width auto (debounced).
+            self._auto_timer.start()
 
     def _reset_monitor_combo(self) -> None:
+        self._monitors = []
         self.monitor_combo.blockSignals(True)
         self.monitor_combo.clear()
         self.monitor_combo.addItem("Theo host", None)
@@ -758,10 +950,16 @@ class MainWindow(QMainWindow):
         self.worker.clipboard_from_host.connect(self._on_clipboard_from_host)
         self.worker.monitors_ready.connect(self._on_monitors_ready)
         self.worker.start()
-        width = self._selected_width()
-        if width is not None:
-            self.worker.send_control(
-                {"event": "set_resolution", "max_width": width})
+        mode = self._resolution_mode()
+        if mode == "manual":
+            width = self._selected_width()
+            if width is not None:
+                self.worker.send_control(
+                    {"event": "set_resolution", "max_width": width})
+        elif mode == "auto":
+            # Gửi ngay theo giả định 16:9 (phòng host cũ không gửi packet
+            # monitors); sẽ gửi lại đúng tỉ lệ ngay khi nhận monitors_ready.
+            self._send_resolution()
 
         self.connect_btn.setText("Disconnect")
         self._set_form_enabled(False)
@@ -805,6 +1003,7 @@ class MainWindow(QMainWindow):
 
     def _teardown_worker(self) -> None:
         self._clipboard_timer.stop()
+        self._auto_timer.stop()
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(2000)
@@ -839,6 +1038,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self._want_connected = False
         self._reconnect_timer.stop()
+        self._auto_timer.stop()
         self._save_settings()
         if self.worker is not None:
             self.worker.stop()

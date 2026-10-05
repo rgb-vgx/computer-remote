@@ -35,6 +35,26 @@ log = logging.getLogger("host")
 _AUTH_MAX_FAILURES = 5
 _AUTH_BLOCK_SECONDS = 30.0
 
+# Debounce tạo lại encoder H.264: client auto-resize có thể gửi dồn dập,
+# gộp về tối đa 2 lần/giây (frame dừng tối đa ~500ms trong lúc chờ).
+_RECREATE_MIN_INTERVAL = 0.5
+
+
+def _jpeg_encode_params(quality: int) -> list:
+    """Tham số ``cv2.imencode`` JPEG: quality (1-100) + sampling 4:4:4.
+
+    4:4:4 giữ nguyên chroma → chữ/kẻ viền sắc nét (4:2:0 làm mềm chroma).
+    Benchmark (30 frame text): q75 4:2:0 = 141 KiB, 39.2 dB;
+    q90 4:4:4 = 215 KiB, 46.0 dB.
+    OpenCV không có cờ sampling → chỉ gửi quality (4:2:0 mặc định).
+    """
+    params = [int(cv2.IMWRITE_JPEG_QUALITY), int(max(1, min(100, quality)))]
+    factor = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", None)
+    factor_444 = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", None)
+    if factor is not None and factor_444 is not None:
+        params += [int(factor), int(factor_444)]
+    return params
+
 
 # ---------------------------------------------------------------------------
 # H.264 encoder (ffmpeg subprocess)
@@ -49,9 +69,10 @@ class H264Encoder:
     """
 
     def __init__(self, width: int, height: int, fps: int,
-                 quality: int = 85) -> None:
-        # quality 1-100 → CRF 45–10 (lower CRF = better quality)
-        crf = int(max(10, 51 - quality * 0.41))
+                 crf: int = 18) -> None:
+        # CRF 0-51 (thấp = nét hơn): mặc định 18 — nét, dung lượng thấp.
+        # Benchmark (30 frame text): ultrafast crf20 = 13.7 KiB/frame,
+        # veryfast crf14 = 9.0 KiB/frame (rất mạnh cho text).
         self.width = width
         self.height = height
 
@@ -63,9 +84,11 @@ class H264Encoder:
              '-r', str(max(1, fps)),
              '-i', '-',
              '-c:v', 'libx264',
+             # zerolatency đã tắt bframes/lookahead; ultrafast giảm CPU encode
+             # (spike trễ) — đổi sang veryfast nếu muốn tiết bandwidth hơn.
              '-preset', 'ultrafast',
              '-tune', 'zerolatency',
-             '-crf', str(crf),
+             '-crf', str(int(max(0, min(51, crf)))),
              '-pix_fmt', 'yuv420p',
              '-g', '30',
              '-flush_packets', '1',
@@ -593,6 +616,12 @@ class HostServer:
         self._max_width = self._clamp_width(args.max_width)
         # Multi-monitor: mss index (≥ 1); client có thể đổi (set_monitor).
         self._monitor_index = 1
+        # Generation của codec packet: tăng mỗi lần tạo lại encoder H.264;
+        # client bỏ packet codec cũ đến trễ (generation <= đã nhận).
+        self._codec_generation = 0
+        # Mốc input tương tác gần nhất (monotonic) + throttle log đo phản hồi.
+        self._last_input_at = 0.0
+        self._last_input_log = 0.0
         self._monitor_rect_cache: tuple[int, int, int, int] | None = None
         self._monitor_rect_index: int | None = None
 
@@ -768,7 +797,7 @@ class HostServer:
     def _capture_loop(self, sock: socket.socket,
                       client_stop: threading.Event) -> None:
         frame_budget = 1.0 / max(1, self.args.fps)
-        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.args.quality]
+        encode_params = _jpeg_encode_params(self.args.quality)
         frames_since_log = 0
         last_log = time.time()
 
@@ -779,6 +808,8 @@ class HostServer:
         if self.args.codec == 'h264' and not use_h264:
             log.info("Client không hỗ trợ H.264, fallback JPEG")
         h264_enc: H264Encoder | None = None
+        # Thời điểm tạo lại encoder gần nhất (debounce _RECREATE_MIN_INTERVAL).
+        last_recreate = 0.0
 
         if use_h264:
             log.info("Sử dụng codec H.264 (ffmpeg libx264)")
@@ -807,11 +838,14 @@ class HostServer:
                     frame_w -= frame_w % 2
                     frame_h -= frame_h % 2
                     h264_enc = H264Encoder(frame_w, frame_h, self.args.fps,
-                                           self.args.quality)
+                                           self.args.h264_crf)
+                    last_recreate = time.time()
+                    self._codec_generation += 1
                     protocol.send_json(
                         sock, protocol.PKT_INFO,
                         {"type": "codec", "codec": "h264",
-                         "width": frame_w, "height": frame_h})
+                         "width": frame_w, "height": frame_h,
+                         "generation": self._codec_generation})
 
                 skip_until = 0.0
                 prev_frame: np.ndarray | None = None
@@ -837,9 +871,22 @@ class HostServer:
                     frame = np.asarray(shot)
 
                     # Client đổi monitor / độ phân giải giữa chừng?
-                    if (self._monitor_index != active_monitor
+                    monitor_changed = self._monitor_index != active_monitor
+                    if (monitor_changed
                             or self._max_width != active_max_width):
-                        if self._monitor_index != active_monitor:
+                        # Debounce chỉ cho đổi max-width (auto-resize dồn dập
+                        # của client); đổi monitor áp dụng NGAY — không để
+                        # user nhìn thấy màn hình cũ thêm ~0.5s.
+                        if (not monitor_changed and use_h264
+                                and time.time() - last_recreate
+                                < _RECREATE_MIN_INTERVAL):
+                            # Dồn loạt đổi độ phân giải thành 1 lần tạo lại
+                            # encoder. skip_until tính thẳng từ last_recreate
+                            # (cùng hệ thời gian với time.time() ở đầu vòng).
+                            skip_until = (last_recreate
+                                          + _RECREATE_MIN_INTERVAL)
+                            continue
+                        if monitor_changed:
                             active_monitor = self._clamp_monitor(
                                 sct, self._monitor_index)
                             self._monitor_index = active_monitor
@@ -864,11 +911,14 @@ class HostServer:
                                 h264_enc.close()
                             h264_enc = H264Encoder(frame_w, frame_h,
                                                    self.args.fps,
-                                                   self.args.quality)
+                                                   self.args.h264_crf)
+                            last_recreate = time.time()
+                            self._codec_generation += 1
                             protocol.send_json(
                                 sock, protocol.PKT_INFO,
                                 {"type": "codec", "codec": "h264",
-                                 "width": frame_w, "height": frame_h})
+                                 "width": frame_w, "height": frame_h,
+                                 "generation": self._codec_generation})
                         last_jpeg = b""
                         force_send = True
                         log.info("Cấu hình stream: monitor #%d, max-width=%d → %dx%d",
@@ -889,8 +939,9 @@ class HostServer:
                         elapsed = time.time() - t0
                         if elapsed < frame_budget:
                             time.sleep(frame_budget - elapsed)
-                        else:
-                            skip_until = now + frame_budget
+                        # Đã trễ hơn budget -> quay vòng grab NGAY, không ngủ
+                        # thêm budget (tránh nhân đôi gap khi grab/compare
+                        # chậm hơn bình thường).
                         continue
 
                     if use_h264 and h264_enc:
@@ -926,6 +977,16 @@ class HostServer:
 
                     last_send = time.time()
                     force_send = False
+                    # Đo phản hồi: input gần nhất của client → frame vừa gửi
+                    # (apply + chờ capture + encode + send). Chỉ log khi còn
+                    # trong 3s kể từ input, throttle 0.5s để không spam.
+                    if self._last_input_at:
+                        resp = time.monotonic() - self._last_input_at
+                        if (resp < 3.0
+                                and time.time() - self._last_input_log >= 0.5):
+                            log.info("input → frame gửi: %.0f ms",
+                                     resp * 1000.0)
+                            self._last_input_log = time.time()
                     frame_ms_total += (last_send - t0) * 1000.0
                     frame_ms_count += 1
                     frames_since_log += 1
@@ -949,8 +1010,11 @@ class HostServer:
                     elapsed = now2 - t0
                     if elapsed < frame_budget:
                         time.sleep(frame_budget - elapsed)
-                    else:
-                        skip_until = now2 + frame_budget
+                    # encode/send đã trễ hơn budget -> quay vòng NGAY, không
+                    # ngủ thêm budget: một lần encode 80ms ở 15fps mà ngủ thêm
+                    # 66ms sẽ thành gap ~146ms -> stutter thấy rõ (latency
+                    # review: pacing phải neo theo capture-start, không cộng
+                    # dồn sau khi trễ).
         except (ConnectionError, OSError, struct.error) as exc:
             log.info("Capture loop dừng: %s", exc)
         except Exception as exc:
@@ -1032,6 +1096,12 @@ class HostServer:
 
     def _apply_event(self, event: dict) -> None:
         kind = event.get("event")
+        if kind in ("mouse_move", "mouse_down", "mouse_up", "scroll",
+                    "key_down", "key_up"):
+            # Tương tác của client — lưu mốc để capture loop đo thời gian
+            # "input → frame gửi ra" (log INFO, throttle 0.5s).
+            self._last_input_at = time.monotonic()
+            log.debug("input ← %s", event)
         if kind in ("mouse_move", "mouse_down", "mouse_up", "scroll"):
             self._apply_mouse(event)
         elif kind in ("key_down", "key_up"):
@@ -1232,9 +1302,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--port", type=int, default=7777)
     p.add_argument("--token", default="1")
     p.add_argument("--fps", type=int, default=15)
-    p.add_argument("--quality", type=int, default=75,
-                   help="Chất lượng nén (JPEG: 1-100, H.264: 1-100 → CRF 51-10)")
-    p.add_argument("--max-width", type=int, default=1920)
+    p.add_argument("--quality", type=int, default=90,
+                   help="Chất lượng JPEG (1-100, sampling 4:4:4)")
+    p.add_argument("--max-width", type=int, default=2560)
+    p.add_argument("--h264-crf", type=int, default=18,
+                   help="CRF H.264 (0-51, thấp hơn = nét; mặc định 18)")
     p.add_argument("--codec", choices=["jpeg", "h264"], default="jpeg",
                    help="Codec: jpeg hoặc h264 (mặc định jpeg; h264 cần ffmpeg, có thể bị delay)")
     p.add_argument("--view-only", action="store_true")

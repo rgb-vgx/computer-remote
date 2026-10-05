@@ -58,9 +58,20 @@ def test_client_status_and_kick(qapp):
 def test_server_thread_signals(qapp):
     thread = host_gui.ServerThread(SimpleNamespace(
         token="t", codec="jpeg", bind="127.0.0.1", port=0, fps=15,
-        quality=75, max_width=1920, view_only=False, debug=False))
+        quality=75, max_width=1920, h264_crf=18, view_only=False,
+        debug=False))
     assert hasattr(thread, "client_connected")
     assert hasattr(thread, "client_disconnected")
+
+
+def test_parse_gui_args_defaults():
+    args = host_gui.parse_gui_args([])
+    assert args.quality == 90
+    assert args.max_width == 2560
+    assert args.h264_crf == 18
+    args = host_gui.parse_gui_args(["--quality", "75", "--max-width", "1920",
+                                    "--h264-crf", "22"])
+    assert (args.quality, args.max_width, args.h264_crf) == (75, 1920, 22)
 
 
 def test_autostart_linux_xdg(monkeypatch, tmp_path):

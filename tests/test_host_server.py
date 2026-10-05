@@ -13,7 +13,7 @@ from common import protocol
 
 def make_server(**overrides):
     values = dict(bind="127.0.0.1", port=0, token="secret1", fps=15,
-                  quality=75, max_width=1920, codec="jpeg",
+                  quality=75, max_width=1920, codec="jpeg", h264_crf=18,
                   view_only=False, debug=False)
     values.update(overrides)
     return host.HostServer(SimpleNamespace(**values))

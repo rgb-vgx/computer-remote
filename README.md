@@ -56,7 +56,7 @@ pip install -r requirements.txt
 Linux (CLI):
 
 ```bash
-python host.py --bind 0.0.0.0 --port 7777 --token "change-me" --fps 15 --quality 75
+python host.py --bind 0.0.0.0 --port 7777 --token "change-me" --fps 15
 ```
 
 Windows (GUI — khuyến nghị) hoặc Linux (GUI/tray):
@@ -73,8 +73,9 @@ Tham số:
 | `--port` | `7777` | Cổng TCP |
 | `--token` | *(bắt buộc)* | Client phải gửi đúng mới được stream |
 | `--fps` | `15` | Frame/giây mục tiêu (10–15 hợp lý) |
-| `--quality` | `75` | Chất lượng JPEG 1–100 |
-| `--max-width` | `1920` | Resize xuống nếu rộng hơn (giữ tỉ lệ) |
+| `--quality` | `90` | Chất lượng JPEG 1–100 (sampling 4:4:4 — chữ nét) |
+| `--max-width` | `2560` | Resize xuống nếu rộng hơn (giữ tỉ lệ) |
+| `--h264-crf` | `18` | CRF H.264 0–51 (thấp hơn = nét hơn) |
 | `--view-only` | *(tắt)* | Bật để chỉ xem, **không** nhận điều khiển |
 
 ## 4. Lấy Tailscale IP trên Kubuntu
@@ -100,11 +101,19 @@ Token: change-me
 Bấm **Connect**. Di chuột / click trái / click phải trong vùng hiển thị để điều
 khiển host. Bấm **Disconnect** (hoặc đóng cửa sổ) để dừng.
 
-Combo **Độ phân giải** đổi `max-width` của stream ngay khi đang xem (thấp hơn
-= mượt hơn, ít băng thông hơn): nhiều preset từ 320 đến 3840 (4K), hoặc gõ số
-tùy ý trong khoảng 160–7680. Chọn **Theo host** để giữ đúng tham số
-`--max-width` lúc host khởi động. Với H.264, host tạo lại encoder và client
-tạo lại decoder tương ứng. Góc phải dưới hiện kích thước frame đang nhận.
+Combo **Độ phân giải** (mặc định **Tự động (vừa cửa sổ)**): stream tự khớp
+đúng kích thước cửa sổ xem này và hiển thị 1:1 pixel — nét tối đa, ít băng
+thông nhất (giống AnyDesk). Width tính theo tỉ lệ màn hình host đang chọn
+(contain-fit, không bao giờ request lớn hơn monitor). Cửa sổ đổi tỉ lệ thì
+client tự gửi lại yêu cầu (debounce 200ms; host gộp tạo lại encoder tối đa
+2 lần/giây). Các chế độ khác:
+
+- **Preset / gõ tay** — 320→3840 (4K) hoặc số tùy ý 160–7680.
+- **Theo host** — giữ nguyên `--max-width` lúc host khởi động.
+
+Với H.264, host tạo lại encoder (gửi kèm `generation` để client bỏ packet cũ
+đến trễ) và client tạo lại decoder tương ứng. Góc phải dưới hiện kích thước
+frame đang nhận.
 
 Client tự lưu Host/Port/Token/độ phân giải/kích thước cửa sổ cho lần sau. Khi
 mất mạng, client **tự kết nối lại** (1s → 2s → 4s → 8s → 10s); nếu host từ

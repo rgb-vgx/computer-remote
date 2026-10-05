@@ -41,7 +41,7 @@ def fake_screen(monkeypatch):
 def make_args(codec="jpeg", max_width=W):
     return SimpleNamespace(bind="127.0.0.1", port=0, token="t", fps=15,
                            quality=75, max_width=max_width, codec=codec,
-                           view_only=False, debug=False)
+                           h264_crf=18, view_only=False, debug=False)
 
 
 def run_capture(fake_screen, codec="jpeg", supports_h264=False,
@@ -143,6 +143,29 @@ def test_resolution_clamp():
     assert srv._max_width == W  # quay về --max-width lúc khởi động
 
 
+def test_jpeg_encode_params():
+    def pairs(params):
+        return dict(zip(params[::2], params[1::2]))
+
+    p = pairs(host._jpeg_encode_params(90))
+    assert p[int(cv2.IMWRITE_JPEG_QUALITY)] == 90
+    assert pairs(host._jpeg_encode_params(999))[int(cv2.IMWRITE_JPEG_QUALITY)] == 100
+    assert pairs(host._jpeg_encode_params(0))[int(cv2.IMWRITE_JPEG_QUALITY)] == 1
+    sampling = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", None)
+    if sampling is not None:  # OpenCV đủ mới -> hardcode 4:4:4 (nét nhất)
+        assert p[int(sampling)] == int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444)
+
+
+def test_parse_args_defaults():
+    args = host.parse_args([])
+    assert args.quality == 90
+    assert args.max_width == 2560
+    assert args.h264_crf == 18
+    args = host.parse_args(["--quality", "75", "--max-width", "1920",
+                            "--h264-crf", "20"])
+    assert (args.quality, args.max_width, args.h264_crf) == (75, 1920, 20)
+
+
 requires_ffmpeg = pytest.mark.skipif(
     not (host.H264Encoder.available() and host.H264Encoder.libx264_available()),
     reason="cần ffmpeg + libx264")
@@ -157,6 +180,11 @@ def test_h264_stream_and_resolution(fake_screen):
     dims = [(i["width"], i["height"]) for i in infos]
     assert dims[0] == (W, H)
     assert (320, 180) in dims
+    # generation tăng dần theo mỗi lần tạo lại encoder (bỏ packet cũ ở client)
+    gens = [i.get("generation") for i in infos]
+    assert gens[0] == 1
+    assert all(isinstance(g, int) for g in gens)
+    assert gens == sorted(gens) and len(set(gens)) == len(gens)
 
     dec = None
     decoded = {}
@@ -189,3 +217,61 @@ def test_h264_stream_and_resolution(fake_screen):
             decoded[key] = decoded.get(key, 0) + 1
         dec.close()
     assert decoded.get((320, 180), 0) >= 1, decoded
+
+
+@requires_ffmpeg
+def test_h264_recreate_debounced(fake_screen, monkeypatch):
+    """2 lần đổi max-width sát nhau -> gộp 1 lần tạo lại encoder.
+
+    Không bao giờ xuất hiện frame ở width trung gian (320) nếu 2 request
+    nằm trong cửa sổ debounce — client auto-resize dồn dập không làm host
+    recreate encoder liên tục.
+    """
+    monkeypatch.setattr(host, "_RECREATE_MIN_INTERVAL", 1.0)  # nới cho ổn định
+    srv = host.HostServer(make_args("h264"))
+    srv._client_supports_h264 = True
+    a, b = socket.socketpair()
+    stop = threading.Event()
+    packets = []
+    codec_seen = threading.Event()
+    end = time.time() + 5.0
+
+    def reader():
+        while time.time() < end:
+            ready, _, _ = __import__("select").select([b], [], [], 0.1)
+            if not ready:
+                continue
+            try:
+                ptype, payload = protocol.recv_packet(b)
+            except Exception:
+                return
+            packets.append((ptype, payload))
+            if ptype == protocol.PKT_INFO:
+                try:
+                    if protocol.decode_json(payload).get("type") == "codec":
+                        codec_seen.set()
+                except Exception:
+                    pass
+
+    threading.Thread(target=reader, daemon=True).start()
+    thread = threading.Thread(target=srv._capture_loop, args=(a, stop),
+                              daemon=True)
+    thread.start()
+    assert codec_seen.wait(timeout=3.0), "không nhận được codec info đầu tiên"
+
+    # 2 request sát nhau (trong cửa sổ debounce) -> chỉ tạo lại 1 encoder
+    srv._apply_event({"event": "set_resolution", "max_width": 320})
+    srv._apply_event({"event": "set_resolution", "max_width": 480})
+    time.sleep(2.0)  # chờ debounce (1.0s) + biên an toàn
+    stop.set()
+    thread.join(timeout=4)
+    a.close()
+    b.close()
+
+    infos = [protocol.decode_json(p) for t, p in packets
+             if t == protocol.PKT_INFO
+             and protocol.decode_json(p).get("type") == "codec"]
+    dims = [(i["width"], i["height"]) for i in infos]
+    # exactly: ban đầu + 1 lần gộp (480), KHÔNG có lần tạo lại cho 320
+    assert dims == [(W, H), (480, 270)], dims
+    assert [i["generation"] for i in infos] == [1, 2]
