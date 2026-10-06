@@ -24,13 +24,13 @@ from logging.handlers import RotatingFileHandler
 import cv2
 import numpy as np
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QImage, QIntValidator, QPixmap
+from PySide6.QtGui import QColor, QFont, QImage, QIntValidator, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QPushButton, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QPushButton, QToolButton, QVBoxLayout, QWidget,
 )
 
-from common import app_log_dir, no_console_kwargs, protocol
+from common import app_log_dir, no_console_kwargs, protocol, ui
 from common.updater import current_version
 from common.updater_qt import UpdateController
 
@@ -443,8 +443,10 @@ class RemoteView(QLabel):
         super().__init__()
         self.setMinimumSize(640, 360)
         self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("background-color: #101010; color: #aaa;")
+        self.setStyleSheet(f"background-color: {ui.COLORS['canvas']};")
         self.setText("Chưa kết nối")
+        self._hint = "Nhập địa chỉ Host và Token, rồi bấm Kết nối"
+        self._empty_icon = ui.icon_pixmap("monitor", ui.COLORS["subtle"], 56)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         # Cho phép IME (bộ gõ tiếng Việt/CJK) commit text vào widget này.
@@ -466,11 +468,41 @@ class RemoteView(QLabel):
         # đang gõ ở form (token, độ phân giải). Focus sang view khi Connect
         # (_connect) hoặc click vào vùng xem (mousePressEvent).
 
-    def clear_frame(self, text: str) -> None:
+    def clear_frame(self, text: str, hint: str = "") -> None:
         self._frame = None
         self._pixmap = None
+        self._hint = hint
         self.setPixmap(QPixmap())
         self.setText(text)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        if self._frame is not None:
+            super().paintEvent(event)
+            return
+        # Empty state: icon + tiêu đề + gợi ý, căn giữa vùng xem.
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor(ui.COLORS["canvas"]))
+        icon_size = 56
+        cx, cy = self.width() / 2, self.height() / 2
+        painter.drawPixmap(int(cx - icon_size / 2), int(cy - 64), self._empty_icon)
+        title_font = QFont(self.font())
+        title_font.setPixelSize(16)
+        title_font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(title_font)
+        painter.setPen(QColor(ui.COLORS["text"]))
+        painter.drawText(0, int(cy + 4), self.width(), 24,
+                         Qt.AlignmentFlag.AlignHCenter, self.text())
+        if self._hint:
+            hint_font = QFont(self.font())
+            hint_font.setPixelSize(13)
+            painter.setFont(hint_font)
+            painter.setPen(QColor(ui.COLORS["muted"]))
+            painter.drawText(24, int(cy + 32), self.width() - 48, 40,
+                             Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap,
+                             self._hint)
+        painter.end()
 
     def resizeEvent(self, event) -> None:
         self._rescale()
@@ -611,24 +643,53 @@ RES_AUTO = "auto"
 
 
 class MainWindow(QMainWindow):
+    TEXT_CONNECT = "Kết nối"
+    TEXT_DISCONNECT = "Ngắt kết nối"
+
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(f"Remote Desktop Client (MVP) v{current_version()}")
+        self.setWindowTitle(f"Remote Desktop Client v{current_version()}")
+        self.setWindowIcon(ui.app_icon())
         self.worker: NetworkWorker | None = None
 
         self._last_clipboard = ""
         self._clipboard_skip = 0
 
         self.host_edit = QLineEdit("100.")
-        self.host_edit.setPlaceholderText("Tailscale IP, vd 100.x.y.z")
+        self.host_edit.setPlaceholderText("100.x.y.z")
+        self.host_edit.setToolTip("Địa chỉ IP Tailscale của máy host")
+        self.host_edit.setAccessibleName("Địa chỉ host")
+        self.host_edit.setMinimumWidth(150)
+        self.host_edit.setFont(ui.mono_font(13))
         self.port_edit = QLineEdit("7777")
-        self.port_edit.setFixedWidth(70)
+        self.port_edit.setFixedWidth(68)
+        self.port_edit.setValidator(QIntValidator(1, 65535, self.port_edit))
+        self.port_edit.setAccessibleName("Port")
+        self.port_edit.setFont(ui.mono_font(13))
         self.token_edit = QLineEdit()
         self.token_edit.setPlaceholderText("token")
         self.token_edit.setEchoMode(QLineEdit.Password)
-        self.connect_btn = QPushButton("Connect")
+        self.token_edit.setAccessibleName("Token")
+        self.token_edit.setMinimumWidth(120)
+        self.show_token_btn = QToolButton()
+        self.show_token_btn.setCheckable(True)
+        self.show_token_btn.setProperty("variant", "ghost")
+        self.show_token_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.show_token_btn.toggled.connect(self._on_show_token)
+        self._on_show_token(False)
+        self.connect_btn = QPushButton(self.TEXT_CONNECT)
+        self.connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.connect_btn.setMinimumWidth(130)
+        self.connect_btn.setDefault(True)
         self.connect_btn.clicked.connect(self._toggle_connection)
-        self.update_btn = QPushButton("Cập nhật")
+        for edit in (self.host_edit, self.port_edit, self.token_edit):
+            edit.returnPressed.connect(self._connect_from_form)
+        self.update_btn = QToolButton()
+        self.update_btn.setIcon(ui.icon("refresh", ui.COLORS["muted"]))
+        self.update_btn.setProperty("variant", "ghost")
+        self.update_btn.setToolTip("Kiểm tra cập nhật")
+        self.update_btn.setAccessibleName("Kiểm tra cập nhật")
+        self.update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.update_btn.clicked.connect(self._check_update)
         self.updater = UpdateController(self, "client")
 
@@ -649,6 +710,11 @@ class MainWindow(QMainWindow):
         ):
             self.res_combo.addItem(label, width)
         self.res_combo.setCurrentIndex(0)
+        self.res_combo.setMinimumWidth(205)
+        # Combo editable cuộn tới cuối chữ → luôn hiện từ đầu nhãn preset.
+        self.res_combo.currentIndexChanged.connect(
+            lambda _i: self.res_combo.lineEdit().setCursorPosition(0))
+        self.res_combo.setAccessibleName("Độ phân giải stream")
         self.res_combo.setToolTip(
             "Độ phân giải stream (max-width, 160–7680).\n"
             "'Tự động' (mặc định): stream khớp đúng kích thước cửa sổ này,\n"
@@ -662,24 +728,43 @@ class MainWindow(QMainWindow):
         self.monitor_combo = QComboBox()
         self.monitor_combo.addItem("Theo host", None)
         self.monitor_combo.setEnabled(False)
+        self.monitor_combo.setMinimumWidth(130)
+        self.monitor_combo.setAccessibleName("Màn hình host")
         self.monitor_combo.setToolTip(
             "Chọn màn hình host để xem/điều khiển.\n"
             "Host gửi danh sách khi kết nối; 'Theo host' = màn hình chính.")
         self.monitor_combo.currentIndexChanged.connect(self._on_monitor_changed)
 
-        form = QHBoxLayout()
-        form.addWidget(QLabel("Host:"))
-        form.addWidget(self.host_edit)
-        form.addWidget(QLabel("Port:"))
-        form.addWidget(self.port_edit)
-        form.addWidget(QLabel("Token:"))
-        form.addWidget(self.token_edit)
-        form.addWidget(QLabel("Màn hình:"))
-        form.addWidget(self.monitor_combo)
-        form.addWidget(QLabel("Độ phân giải:"))
-        form.addWidget(self.res_combo)
-        form.addWidget(self.connect_btn)
-        form.addWidget(self.update_btn)
+        # ---- Toolbar: [logo] kết nối | hiển thị ............ [cập nhật]
+        toolbar = QFrame()
+        toolbar.setObjectName("toolbar")
+        bar = QHBoxLayout(toolbar)
+        bar.setContentsMargins(14, 10, 14, 10)
+        bar.setSpacing(8)
+        logo = QLabel()
+        logo.setPixmap(ui.app_icon().pixmap(28, 28))
+        logo.setToolTip("Remote Desktop Client")
+        bar.addWidget(logo)
+        bar.addSpacing(6)
+
+        def field(text: str, widget: QWidget) -> None:
+            lbl = ui.label(text, "field")
+            lbl.setBuddy(widget)
+            bar.addWidget(lbl)
+            bar.addWidget(widget)
+
+        field("Host", self.host_edit)
+        field("Port", self.port_edit)
+        field("Token", self.token_edit)
+        bar.addWidget(self.show_token_btn)
+        bar.addWidget(self.connect_btn)
+        bar.addSpacing(4)
+        bar.addWidget(ui.vline())
+        bar.addSpacing(4)
+        field("Màn hình", self.monitor_combo)
+        field("Độ phân giải", self.res_combo)
+        bar.addStretch(1)
+        bar.addWidget(self.update_btn)
 
         self.view = RemoteView()
         self.view.mouse_event.connect(self._on_mouse_event)
@@ -688,25 +773,41 @@ class MainWindow(QMainWindow):
         # Danh sách monitor host (nhận khi kết nối) — dùng cho chế độ Tự động.
         self._monitors: list[dict] = []
         self._monitor_current = 1
-        self.status_label = QLabel("Trạng thái: Disconnected")
-        self.status_label.setStyleSheet("padding: 4px;")
+
+        # ---- Status bar: pill trạng thái ........ kích thước frame | version
+        self.status_label = QLabel("Chưa kết nối")
         self.status_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.size_label = QLabel("")
-        self.size_label.setStyleSheet("padding: 4px; color: #888;")
+        self.status_pill = ui.StatusPill(state="idle", text_label=self.status_label)
+        self.size_icon = QLabel()
+        self.size_icon.setPixmap(ui.icon_pixmap("monitor", ui.COLORS["muted"], 14))
+        self.size_icon.setVisible(False)
+        self.size_label = ui.label("", "muted")
+        self.size_label.setFont(ui.mono_font(12))
         self.size_label.setToolTip("Kích thước frame nhận được từ host")
 
-        bottom = QHBoxLayout()
-        bottom.addWidget(self.status_label, stretch=1)
+        statusbar = QFrame()
+        statusbar.setObjectName("statusbar")
+        bottom = QHBoxLayout(statusbar)
+        bottom.setContentsMargins(12, 6, 14, 6)
+        bottom.setSpacing(8)
+        bottom.addWidget(self.status_pill)
+        bottom.addStretch(1)
+        bottom.addWidget(self.size_icon)
         bottom.addWidget(self.size_label)
+        bottom.addSpacing(8)
+        bottom.addWidget(ui.label(f"v{current_version()}", "muted"))
 
         central = QWidget()
         layout = QVBoxLayout(central)
-        layout.addLayout(form)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(toolbar)
         layout.addWidget(self.view, stretch=1)
-        layout.addLayout(bottom)
+        layout.addWidget(statusbar)
         self.setCentralWidget(central)
-        self.resize(1100, 720)
+        self.resize(1200, 760)
+        self._set_connected_ui(False)
 
         self._clipboard_timer = QTimer(self)
         self._clipboard_timer.timeout.connect(self._check_clipboard)
@@ -775,6 +876,35 @@ class MainWindow(QMainWindow):
                 self.settings.setValue("manual_width", width)
         self.settings.setValue("resolution", self.res_combo.currentText())
         self.settings.setValue("geometry", self.saveGeometry())
+
+    # ---- UI state --------------------------------------------------------
+
+    def _on_show_token(self, checked: bool) -> None:
+        self.token_edit.setEchoMode(
+            QLineEdit.Normal if checked else QLineEdit.Password)
+        self.show_token_btn.setIcon(
+            ui.icon("eye-off" if checked else "eye", ui.COLORS["muted"]))
+        tip = "Ẩn token" if checked else "Hiện token"
+        self.show_token_btn.setToolTip(tip)
+        self.show_token_btn.setAccessibleName(tip)
+
+    def _set_status(self, state: str, text: str) -> None:
+        self.status_pill.set_state(state, text)
+
+    def _set_connected_ui(self, connected: bool) -> None:
+        """Nút Kết nối/Ngắt kết nối: đổi chữ, icon và màu (primary ↔ danger)."""
+        if connected:
+            self.connect_btn.setText(self.TEXT_DISCONNECT)
+            self.connect_btn.setIcon(ui.icon("unplug", "#FFFFFF"))
+            ui.set_prop(self.connect_btn, "variant", "danger")
+        else:
+            self.connect_btn.setText(self.TEXT_CONNECT)
+            self.connect_btn.setIcon(ui.icon("plug", "#FFFFFF"))
+            ui.set_prop(self.connect_btn, "variant", "primary")
+
+    def _connect_from_form(self) -> None:
+        if not self._want_connected and self.worker is None:
+            self._connect()
 
     def _toggle_connection(self) -> None:
         if self._want_connected or self.worker is not None:
@@ -921,6 +1051,7 @@ class MainWindow(QMainWindow):
         size = f"{img.width()}x{img.height()}"
         if self.size_label.text() != size:
             self.size_label.setText(size)
+            self.size_icon.setVisible(True)
 
     def _connect(self) -> None:
         host = self.host_edit.text().strip()
@@ -928,10 +1059,12 @@ class MainWindow(QMainWindow):
         try:
             port = int(self.port_edit.text().strip())
         except ValueError:
-            self.status_label.setText("Trạng thái: Port không hợp lệ")
+            self._set_status("error", "Port không hợp lệ")
+            self.port_edit.setFocus()
             return
         if not host or not token:
-            self.status_label.setText("Trạng thái: Cần nhập Host và Token")
+            self._set_status("error", "Cần nhập Host và Token")
+            (self.host_edit if not host else self.token_edit).setFocus()
             return
 
         self._reconnect_timer.stop()
@@ -942,8 +1075,7 @@ class MainWindow(QMainWindow):
         self.worker = NetworkWorker(host, port, token)
         self.worker.frame_ready.connect(self.view.set_frame)
         self.worker.frame_ready.connect(self._on_frame_ready)
-        self.worker.status.connect(
-            lambda m: self.status_label.setText(f"Trạng thái: {m}"))
+        self.worker.status.connect(self._on_worker_status)
         self.worker.connected.connect(self._on_connected)
         self.worker.rejected.connect(self._on_rejected)
         self.worker.disconnected.connect(self._on_disconnected)
@@ -961,18 +1093,25 @@ class MainWindow(QMainWindow):
             # monitors); sẽ gửi lại đúng tỉ lệ ngay khi nhận monitors_ready.
             self._send_resolution()
 
-        self.connect_btn.setText("Disconnect")
+        self._set_connected_ui(True)
         self._set_form_enabled(False)
         if self._reconnect_attempts == 0:
-            self.status_label.setText("Trạng thái: Connecting...")
+            self._set_status("busy", "Đang kết nối...")
+        if self.view._frame is None:
+            self.view.clear_frame("Đang kết nối...", f"{host}:{port}")
         self.view.setFocus()  # để phím đi vào RemoteView ngay từ đầu
 
         self._last_clipboard = ""
         self._clipboard_skip = 0
         self._clipboard_timer.start(500)
 
+    def _on_worker_status(self, msg: str) -> None:
+        self._set_status("online" if msg.startswith("Đã kết nối") else "busy", msg)
+
     def _on_connected(self) -> None:
         self._reconnect_attempts = 0
+        if self.view._frame is None:
+            self.view.clear_frame("Đã kết nối", "Đang chờ khung hình đầu tiên từ host...")
 
     def _on_rejected(self, reason: str) -> None:
         # Host từ chối (sai token / bị ngắt) — dừng hẳn, không thử lại.
@@ -984,8 +1123,9 @@ class MainWindow(QMainWindow):
         if self._want_connected:
             self._reconnect_attempts += 1
             delay = min(10, 2 ** min(self._reconnect_attempts - 1, 4))
-            self.status_label.setText(
-                f"Trạng thái: Mất kết nối — thử lại sau {delay}s "
+            self._set_status(
+                "busy",
+                f"Mất kết nối — thử lại sau {delay}s "
                 f"(lần {self._reconnect_attempts}): {reason}")
             log.info("Sẽ kết nối lại sau %ds (lần %d): %s",
                      delay, self._reconnect_attempts, reason)
@@ -1015,15 +1155,19 @@ class MainWindow(QMainWindow):
         self._reconnect_timer.stop()
         self._reconnect_attempts = 0
         self._teardown_worker()
-        self.connect_btn.setText("Connect")
+        self._set_connected_ui(False)
         self._set_form_enabled(True)
         self._reset_monitor_combo()
-        self.view.clear_frame("Disconnected")
+        self.view.clear_frame("Đã ngắt kết nối", reason)
         self.size_label.setText("")
-        self.status_label.setText(f"Trạng thái: Disconnected ({reason})")
+        self.size_icon.setVisible(False)
+        failed = reason.startswith(("Host từ chối", "Lỗi", "Không kết nối"))
+        self._set_status("error" if failed else "idle",
+                         f"Đã ngắt kết nối ({reason})")
 
     def _set_form_enabled(self, enabled: bool) -> None:
-        for w in (self.host_edit, self.port_edit, self.token_edit):
+        for w in (self.host_edit, self.port_edit, self.token_edit,
+                  self.show_token_btn):
             w.setEnabled(enabled)
 
     def _on_mouse_event(self, event: dict) -> None:
@@ -1080,6 +1224,8 @@ def main() -> int:
     _setup_logging(args.debug)
     log.info("=== Remote Desktop Client ===")
     app = QApplication(sys.argv)
+    ui.apply_theme(app)
+    app.setWindowIcon(ui.app_icon())
     win = MainWindow()
     win.show()
     return app.exec()

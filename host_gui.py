@@ -16,14 +16,14 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QCursor, QIcon, QPainter, QPixmap, QColor, QTextCursor
+from PySide6.QtGui import QAction, QCursor, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
-    QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
+    QPushButton, QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget,
 )
 
-from common import app_log_dir, no_console_kwargs
+from common import app_log_dir, no_console_kwargs, ui
 from common.updater import current_version
 from common.updater_qt import UpdateController
 from host import HostServer, detect_display, warn_weak_config
@@ -226,7 +226,9 @@ class MainWindow(QMainWindow):
         self.server_thread: ServerThread | None = None
         self.tray_manager: TrayManager | None = None
         self.setWindowTitle(f"Remote Desktop Host v{current_version()}")
-        self.resize(600, 450)
+        self.setWindowIcon(ui.app_icon())
+        self.resize(520, 760)
+        self.setMinimumWidth(440)
 
         # Clipboard state
         self._last_clipboard = ""
@@ -235,78 +237,162 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(14)
 
-        # Info
-        info_group = QGroupBox("Thông tin kết nối")
-        info_layout = QFormLayout(info_group)
+        # ---- Header: logo + tên app + pill trạng thái
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        logo = QLabel()
+        logo.setPixmap(ui.app_icon().pixmap(40, 40))
+        header.addWidget(logo)
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
+        titles.addWidget(ui.label("Remote Desktop Host", "title"))
+        titles.addWidget(ui.label(f"Phiên bản {current_version()}", "muted"))
+        header.addLayout(titles, stretch=1)
+        self.status_label = QLabel("Chưa chạy")
+        self.status_pill = ui.StatusPill(state="idle", text_label=self.status_label)
+        header.addWidget(self.status_pill, alignment=Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(header)
+
+        # ---- Card: địa chỉ kết nối (thông tin client cần nhập)
+        conn_card, conn = ui.card("Địa chỉ kết nối")
+        addr_row = QHBoxLayout()
+        addr_row.setSpacing(8)
+        self.ip_label = ui.label(self._get_ip(), "address")
+        self.ip_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.ip_label.setFont(ui.mono_font(24))
+        self.port_label = ui.label(str(args.port), "muted")
+        self.port_label.setFont(ui.mono_font(16))
+        self.port_label.setToolTip("Port")
+        addr_row.addWidget(self.ip_label)
+        addr_row.addWidget(ui.label(":", "muted"))
+        addr_row.addWidget(self.port_label)
+        addr_row.addStretch(1)
+        self.copy_btn = QToolButton()
+        self.copy_btn.setIcon(ui.icon("copy", ui.COLORS["muted"]))
+        self.copy_btn.setToolTip("Sao chép địa chỉ IP")
+        self.copy_btn.setAccessibleName("Sao chép địa chỉ IP")
+        self.copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.copy_btn.clicked.connect(self._copy_address)
+        addr_row.addWidget(self.copy_btn)
+        conn.addLayout(addr_row)
+
+        conn.addWidget(ui.label("Token truy cập", "field"))
+        token_row = QHBoxLayout()
+        token_row.setSpacing(8)
         self.token_edit = QLineEdit(args.token)
         self.token_edit.setEchoMode(QLineEdit.Password)
         self.token_edit.setMinimumWidth(200)
-        self.show_token_cb = QCheckBox("Hiện token")
-        self.show_token_cb.toggled.connect(
-            lambda checked: self.token_edit.setEchoMode(
-                QLineEdit.Normal if checked else QLineEdit.Password))
-        token_row = QHBoxLayout()
-        token_row.addWidget(self.token_edit)
+        self.token_edit.setPlaceholderText("Nhập token bí mật")
+        self.token_edit.setAccessibleName("Token truy cập")
+        self.token_edit.setFont(ui.mono_font(13))
+        self.show_token_cb = QToolButton()
+        self.show_token_cb.setCheckable(True)
+        self.show_token_cb.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.show_token_cb.toggled.connect(self._on_show_token)
+        self._on_show_token(False)
+        token_row.addWidget(self.token_edit, stretch=1)
         token_row.addWidget(self.show_token_cb)
-        info_layout.addRow("Token:", token_row)
+        conn.addLayout(token_row)
         self.token_edit.editingFinished.connect(self._refresh_autostart_token)
-        self.ip_label = QLabel(self._get_ip())
-        info_layout.addRow("IP:", self.ip_label)
-        self.port_label = QLabel(str(args.port))
-        info_layout.addRow("Port:", self.port_label)
+        layout.addWidget(conn_card)
 
+        # ---- Card: phiên điều khiển
+        session_card, session = ui.card("Phiên điều khiển")
+        client_row = QHBoxLayout()
+        client_row.setSpacing(10)
+        self.client_icon = QLabel()
+        self.client_icon.setPixmap(ui.icon_pixmap("laptop", ui.COLORS["subtle"], 20))
+        client_row.addWidget(self.client_icon)
+        self.client_label = QLabel("Client: chưa có")
+        self.client_label.setProperty("role", "muted")
+        client_row.addWidget(self.client_label, stretch=1)
+        self.kick_btn = QPushButton("Ngắt client")
+        self.kick_btn.setIcon(ui.icon("user-x", "#FCA5A5"))
+        self.kick_btn.setProperty("variant", "danger-outline")
+        self.kick_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.kick_btn.setEnabled(False)
+        self.kick_btn.clicked.connect(self._kick_client)
+        client_row.addWidget(self.kick_btn)
+        session.addLayout(client_row)
+        layout.addWidget(session_card)
+
+        # ---- Card: cài đặt
+        settings_card, settings = ui.card("Cài đặt")
+        codec_row = QHBoxLayout()
+        codec_row.addWidget(ui.label("Codec video", "field"), stretch=1)
         self.codec_combo = QComboBox()
         self.codec_combo.addItems(["H.264 (cần ffmpeg)", "JPEG"])
         self.codec_combo.setCurrentIndex(0 if args.codec == "h264" else 1)
-        info_layout.addRow("Codec:", self.codec_combo)
-
+        self.codec_combo.setMinimumWidth(190)
+        self.codec_combo.setAccessibleName("Codec video")
+        self.codec_combo.setToolTip(
+            "H.264: nhẹ băng thông, cần ffmpeg.\nJPEG: tương thích nhất.\n"
+            "Áp dụng khi bắt đầu chia sẻ.")
+        codec_row.addWidget(self.codec_combo)
+        settings.addLayout(codec_row)
         self.autostart_cb = QCheckBox("Khởi động cùng hệ thống")
         self.autostart_cb.setChecked(autostart_enabled())
+        self.autostart_cb.setCursor(Qt.CursorShape.PointingHandCursor)
         self.autostart_cb.toggled.connect(self._on_autostart_toggled)
-        info_layout.addRow("", self.autostart_cb)
+        settings.addWidget(self.autostart_cb)
+        layout.addWidget(settings_card)
 
-        layout.addWidget(info_group)
-
-        # Status
-        status_group = QGroupBox("Trạng thái")
-        status_layout = QVBoxLayout(status_group)
-        self.status_label = QLabel("Chưa chạy")
-        self.status_label.setStyleSheet("font-weight: bold; padding: 4px;")
-        status_layout.addWidget(self.status_label)
-        self.client_label = QLabel("Client: chưa có")
-        self.client_label.setStyleSheet("padding: 4px; color: #666;")
-        status_layout.addWidget(self.client_label)
-        btn_row = QHBoxLayout()
-        self.start_stop_btn = QPushButton("Bắt đầu")
+        # ---- Hành động chính
+        self.start_stop_btn = QPushButton()
+        self.start_stop_btn.setProperty("size", "lg")
+        self.start_stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.start_stop_btn.clicked.connect(self._toggle_server)
-        btn_row.addWidget(self.start_stop_btn)
-        self.kick_btn = QPushButton("Ngắt client")
-        self.kick_btn.setEnabled(False)
-        self.kick_btn.clicked.connect(self._kick_client)
-        btn_row.addWidget(self.kick_btn)
-        self.update_btn = QPushButton("Cập nhật")
-        self.update_btn.clicked.connect(self._check_update)
-        btn_row.addWidget(self.update_btn)
-        self.quit_btn = QPushButton("Thoát")
-        self.quit_btn.setStyleSheet("color: red;")
-        self.quit_btn.clicked.connect(self._quit_app)
-        btn_row.addWidget(self.quit_btn)
-        status_layout.addLayout(btn_row)
-        layout.addWidget(status_group)
+        layout.addWidget(self.start_stop_btn)
 
         self.updater = UpdateController(self, "host-gui")
 
-        # Log
-        log_group = QGroupBox("Log")
-        log_layout = QVBoxLayout(log_group)
+        # ---- Card: nhật ký
+        log_card, log_layout = ui.card(spacing=8)
+        log_head = QHBoxLayout()
+        log_head.addWidget(ui.label("NHẬT KÝ", "section"), stretch=1)
+        clear_btn = QToolButton()
+        clear_btn.setIcon(ui.icon("trash", ui.COLORS["muted"]))
+        clear_btn.setProperty("variant", "ghost")
+        clear_btn.setToolTip("Xoá nhật ký trên màn hình")
+        clear_btn.setAccessibleName("Xoá nhật ký")
+        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        log_head.addWidget(clear_btn)
+        log_layout.addLayout(log_head)
         self.log_view = QPlainTextEdit()
+        self.log_view.setObjectName("log")
+        self.log_view.setFont(ui.mono_font(12))
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(1000)
+        self.log_view.setMinimumHeight(120)
+        clear_btn.clicked.connect(self.log_view.clear)
         log_layout.addWidget(self.log_view)
-        layout.addWidget(log_group, stretch=1)
+        layout.addWidget(log_card, stretch=1)
+
+        # ---- Footer: hành động phụ
+        footer = QHBoxLayout()
+        self.update_btn = QPushButton("Kiểm tra cập nhật")
+        self.update_btn.setIcon(ui.icon("refresh", ui.COLORS["muted"]))
+        self.update_btn.setProperty("variant", "ghost")
+        self.update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_btn.clicked.connect(self._check_update)
+        footer.addWidget(self.update_btn)
+        footer.addStretch(1)
+        self.quit_btn = QPushButton("Thoát")
+        self.quit_btn.setIcon(ui.icon("power", "#FCA5A5"))
+        self.quit_btn.setProperty("variant", "danger-outline")
+        self.quit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.quit_btn.setToolTip("Dừng chia sẻ và thoát ứng dụng")
+        self.quit_btn.clicked.connect(self._quit_app)
+        footer.addWidget(self.quit_btn)
+        layout.addLayout(footer)
 
         _log_signal.emit_log.connect(self._append_log)
+        self._set_running_ui(False)
+        self.start_stop_btn.setFocus()
 
         # Clipboard timer
         self._clipboard_timer = QTimer(self)
@@ -326,6 +412,67 @@ class MainWindow(QMainWindow):
             except Exception:
                 continue
         return "Không xác định"
+
+    # ---- UI state ------------------------------------------------------
+
+    def _on_show_token(self, checked: bool) -> None:
+        self.token_edit.setEchoMode(
+            QLineEdit.Normal if checked else QLineEdit.Password)
+        self.show_token_cb.setIcon(
+            ui.icon("eye-off" if checked else "eye", ui.COLORS["muted"]))
+        tip = "Ẩn token" if checked else "Hiện token"
+        self.show_token_cb.setToolTip(tip)
+        self.show_token_cb.setAccessibleName(tip)
+
+    def _copy_address(self) -> None:
+        QApplication.clipboard().setText(self.ip_label.text())
+        self.copy_btn.setIcon(ui.icon("check", ui.COLORS["success"]))
+        self.copy_btn.setToolTip("Đã sao chép")
+        QTimer.singleShot(1500, self._reset_copy_btn)
+
+    def _reset_copy_btn(self) -> None:
+        self.copy_btn.setIcon(ui.icon("copy", ui.COLORS["muted"]))
+        self.copy_btn.setToolTip("Sao chép địa chỉ IP")
+
+    def _set_running_ui(self, running: bool, status: str | None = None) -> None:
+        """Đồng bộ nút chính, form và pill theo trạng thái server."""
+        self.token_edit.setEnabled(not running)
+        self.codec_combo.setEnabled(not running)
+        if running:
+            self.start_stop_btn.setText("Dừng chia sẻ")
+            self.start_stop_btn.setIcon(ui.icon("stop", "#FFFFFF"))
+            ui.set_prop(self.start_stop_btn, "variant", "danger")
+            self.status_pill.set_state("busy", status or "Đang khởi động...")
+        else:
+            self.start_stop_btn.setText("Bắt đầu chia sẻ")
+            self.start_stop_btn.setIcon(ui.icon("play", "#FFFFFF"))
+            ui.set_prop(self.start_stop_btn, "variant", "primary")
+            self.status_pill.set_state("idle", status or "Chưa chạy")
+        self._set_client_ui(None)
+        self._update_tray()
+
+    def _set_client_ui(self, addr: str | None) -> None:
+        if addr:
+            self.client_label.setText(f"Client: {addr}")
+            ui.set_prop(self.client_label, "role", None)
+            self.client_icon.setPixmap(
+                ui.icon_pixmap("laptop", ui.COLORS["accent"], 20))
+            self.kick_btn.setEnabled(True)
+            self.status_pill.set_state("active", "Đang được điều khiển")
+        else:
+            self.client_label.setText("Client: chưa có")
+            ui.set_prop(self.client_label, "role", "muted")
+            self.client_icon.setPixmap(
+                ui.icon_pixmap("laptop", ui.COLORS["subtle"], 20))
+            self.kick_btn.setEnabled(False)
+            if self.status_pill.state == "active":
+                self.status_pill.set_state("online", "Đang chờ kết nối")
+        self._update_tray()
+
+    def _update_tray(self) -> None:
+        if self.tray_manager is not None:
+            self.tray_manager.set_state(self.status_pill.state,
+                                        self.status_label.text())
 
     def _append_log(self, msg: str) -> None:
         self.log_view.appendPlainText(msg)
@@ -356,12 +503,7 @@ class MainWindow(QMainWindow):
         self.server_thread.client_connected.connect(self._on_client_connected)
         self.server_thread.client_disconnected.connect(self._on_client_disconnected)
         self.server_thread.start()
-
-        self.start_stop_btn.setText("Dừng")
-        self.token_edit.setEnabled(False)
-        self.status_label.setText("Đang khởi động...")
-        self.client_label.setText("Client: chưa có")
-        self.kick_btn.setEnabled(False)
+        self._set_running_ui(True)
 
         # Start clipboard polling
         self._last_clipboard = ""
@@ -374,25 +516,25 @@ class MainWindow(QMainWindow):
             self.server_thread.stop()
             self.server_thread.wait(3000)
             self.server_thread = None
-        self.start_stop_btn.setText("Bắt đầu")
-        self.token_edit.setEnabled(True)
-        self.status_label.setText("Đã dừng")
-        self.client_label.setText("Client: chưa có")
-        self.kick_btn.setEnabled(False)
+        self._set_running_ui(False, "Đã dừng")
 
     def _on_status_changed(self, status: str) -> None:
-        self.status_label.setText(status)
+        if self.server_thread is None or status == "Đã dừng":
+            return  # _on_server_finished/_stop_server đã cập nhật
+        if status.startswith("Đang lắng nghe"):
+            self.status_pill.set_state("online", "Đang chờ kết nối")
+        else:
+            self.status_label.setText(status)
+        self._update_tray()
 
     def _on_client_connected(self, addr: str) -> None:
-        self.client_label.setText(f"Client: {addr}")
-        self.kick_btn.setEnabled(True)
+        self._set_client_ui(addr)
         if self.tray_manager and self.tray_manager.icon:
             self.tray_manager.icon.showMessage(
                 "Remote Desktop Host", f"Client kết nối: {addr}")
 
     def _on_client_disconnected(self) -> None:
-        self.client_label.setText("Client: chưa có")
-        self.kick_btn.setEnabled(False)
+        self._set_client_ui(None)
 
     def _kick_client(self) -> None:
         if self.server_thread is not None and self.server_thread.server is not None:
@@ -402,11 +544,7 @@ class MainWindow(QMainWindow):
     def _on_server_finished(self) -> None:
         self._clipboard_timer.stop()
         self.server_thread = None
-        self.start_stop_btn.setText("Bắt đầu")
-        self.token_edit.setEnabled(True)
-        self.status_label.setText("Đã dừng")
-        self.client_label.setText("Client: chưa có")
-        self.kick_btn.setEnabled(False)
+        self._set_running_ui(False, "Đã dừng")
 
     # ---- Autostart -------------------------------------------------------
 
@@ -485,28 +623,29 @@ class TrayManager:
         if not QSystemTrayIcon.isSystemTrayAvailable():
             log.warning("Hệ thống không hỗ trợ tray icon.")
             return
-        pixmap = QPixmap(32, 32)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        painter.setBrush(QColor(0, 180, 0))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(2, 2, 28, 28)
-        painter.end()
-        icon = QIcon(pixmap)
-
-        self.icon = QSystemTrayIcon(icon, self.app)
+        self.icon = QSystemTrayIcon(ui.app_icon(ui.STATE_COLORS["idle"]), self.app)
         self.icon.setToolTip("Remote Desktop Host")
         menu = QMenu()
-        show_action = QAction("Hiện / Ẩn")
-        show_action.triggered.connect(self._toggle_window)
-        menu.addAction(show_action)
+        # Giữ tham chiếu QAction (menu không sở hữu action tạo không parent).
+        self._show_action = QAction(ui.icon("monitor"), "Hiện / Ẩn cửa sổ")
+        self._show_action.triggered.connect(self._toggle_window)
+        menu.addAction(self._show_action)
         menu.addSeparator()
-        quit_action = QAction("Thoát")
-        quit_action.triggered.connect(self._quit)
-        menu.addAction(quit_action)
+        self._quit_action = QAction(ui.icon("power", "#FCA5A5"), "Thoát")
+        self._quit_action.triggered.connect(self._quit)
+        menu.addAction(self._quit_action)
+        self._menu = menu
         self.icon.setContextMenu(menu)
         self.icon.activated.connect(self._on_activated)
         self.icon.show()
+        self.window._update_tray()
+
+    def set_state(self, state: str, text: str) -> None:
+        """Icon tray mang chấm trạng thái cùng màu với pill trong cửa sổ."""
+        if self.icon is None:
+            return
+        self.icon.setIcon(ui.app_icon(ui.STATE_COLORS.get(state)))
+        self.icon.setToolTip(f"Remote Desktop Host — {text}")
 
     def _toggle_window(self) -> None:
         if self.window.isVisible():
@@ -579,6 +718,8 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    ui.apply_theme(app)
+    app.setWindowIcon(ui.app_icon())
 
     window = MainWindow(args)
     TrayManager(app, window).setup()

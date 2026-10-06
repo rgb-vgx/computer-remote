@@ -140,7 +140,7 @@ def test_auto_reconnect_flow(window):
     win._connect()
     assert win._want_connected
     first = win.worker
-    assert win.connect_btn.text() == "Disconnect"
+    assert win.connect_btn.text() == win.TEXT_DISCONNECT
 
     # rớt mạng -> hẹn thử lại 1s
     first.disconnected.emit("mất mạng")
@@ -167,7 +167,7 @@ def test_auto_reconnect_flow(window):
     assert not win._want_connected
     assert win.worker is None
     assert not win._reconnect_timer.isActive()
-    assert win.connect_btn.text() == "Connect"
+    assert win.connect_btn.text() == win.TEXT_CONNECT
     assert win.host_edit.isEnabled()
 
 
