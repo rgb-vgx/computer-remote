@@ -15,15 +15,15 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QCursor, QTextCursor
+from PySide6.QtCore import Qt, QObject, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QCursor, QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
-    QPushButton, QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget,
 )
 
-from common import app_log_dir, no_console_kwargs, ui
+from common import app_log_dir, filetransfer, no_console_kwargs, ui
 from common.updater import current_version
 from common.updater_qt import UpdateController
 from host import HostServer, detect_display, warn_weak_config
@@ -182,6 +182,8 @@ class ServerThread(QThread):
     clipboard_from_client = Signal(str)
     client_connected = Signal(str)
     client_disconnected = Signal()
+    file_progress = Signal(bool, str, int, int)
+    file_done = Signal(bool, str, bool, str)
 
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__()
@@ -197,6 +199,8 @@ class ServerThread(QThread):
         self.server.on_client_connected = lambda addr: self.client_connected.emit(
             f"{addr[0]}:{addr[1]}")
         self.server.on_client_disconnected = lambda: self.client_disconnected.emit()
+        self.server.on_file_progress = self.file_progress.emit
+        self.server.on_file_done = self.file_done.emit
 
         self.status_changed.emit("Đang lắng nghe...")
         try:
@@ -227,12 +231,13 @@ class MainWindow(QMainWindow):
         self.tray_manager: TrayManager | None = None
         self.setWindowTitle(f"Remote Desktop Host v{current_version()}")
         self.setWindowIcon(ui.app_icon())
-        self.resize(520, 760)
+        self.resize(520, 860)
         self.setMinimumWidth(440)
 
         # Clipboard state
         self._last_clipboard = ""
         self._clipboard_skip = 0
+        self.setAcceptDrops(True)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -318,6 +323,39 @@ class MainWindow(QMainWindow):
         self.kick_btn.clicked.connect(self._kick_client)
         client_row.addWidget(self.kick_btn)
         session.addLayout(client_row)
+        self.perms_label = ui.label("", "muted")
+        self.perms_label.setVisible(False)
+        session.addWidget(self.perms_label)
+
+        file_row = QHBoxLayout()
+        file_row.setSpacing(8)
+        self.send_file_btn = QPushButton("Gửi file")
+        self.send_file_btn.setIcon(ui.icon("upload", ui.COLORS["text"]))
+        self.send_file_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.send_file_btn.setToolTip(
+            "Gửi file sang máy client (hoặc kéo-thả file vào cửa sổ này)")
+        self.send_file_btn.setEnabled(False)
+        self.send_file_btn.clicked.connect(self._pick_files)
+        file_row.addWidget(self.send_file_btn)
+        self.transfer_bar = QProgressBar()
+        self.transfer_bar.setTextVisible(False)
+        self.transfer_bar.setRange(0, 1000)
+        self.transfer_bar.setVisible(False)
+        file_row.addWidget(self.transfer_bar, stretch=1)
+        self.transfer_label = ui.label("", "muted")
+        file_row.addWidget(self.transfer_label, stretch=1)
+        self.open_folder_btn = QToolButton()
+        self.open_folder_btn.setIcon(ui.icon("folder", ui.COLORS["muted"]))
+        self.open_folder_btn.setProperty("variant", "ghost")
+        self.open_folder_btn.setToolTip("Mở thư mục chứa file nhận từ client")
+        self.open_folder_btn.setAccessibleName("Mở thư mục nhận file")
+        self.open_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.open_folder_btn.clicked.connect(self._open_receive_dir)
+        file_row.addWidget(self.open_folder_btn)
+        session.addLayout(file_row)
+        self._transfer_clear = QTimer(self)
+        self._transfer_clear.setSingleShot(True)
+        self._transfer_clear.timeout.connect(lambda: self.transfer_label.setText(""))
         layout.addWidget(session_card)
 
         # ---- Card: cài đặt
@@ -451,7 +489,25 @@ class MainWindow(QMainWindow):
         self._set_client_ui(None)
         self._update_tray()
 
+    def _session_perms(self) -> dict:
+        thread = self.server_thread
+        server = getattr(thread, "server", None) if thread is not None else None
+        perms = getattr(server, "permissions", None)
+        return perms if isinstance(perms, dict) else {}
+
     def _set_client_ui(self, addr: str | None) -> None:
+        perms = self._session_perms() if addr else {}
+        self.send_file_btn.setEnabled(bool(perms.get("files")))
+        if perms:
+            names = [label for key, label in (("control", "điều khiển"),
+                                              ("clipboard", "clipboard"),
+                                              ("files", "truyền file"))
+                     if perms.get(key)]
+            self.perms_label.setText(
+                "Quyền: " + (", ".join(names) if names else "chỉ xem"))
+        self.perms_label.setVisible(bool(perms))
+        if not addr:
+            self.transfer_bar.setVisible(False)
         if addr:
             self.client_label.setText(f"Client: {addr}")
             ui.set_prop(self.client_label, "role", None)
@@ -473,6 +529,64 @@ class MainWindow(QMainWindow):
         if self.tray_manager is not None:
             self.tray_manager.set_state(self.status_pill.state,
                                         self.status_label.text())
+
+    # ---- Truyền file ---------------------------------------------------
+
+    def _files_allowed(self) -> bool:
+        return self.kick_btn.isEnabled() and bool(self._session_perms().get("files"))
+
+    def _pick_files(self) -> None:
+        if not self._files_allowed():
+            return
+        paths, _ = QFileDialog.getOpenFileNames(self, "Chọn file gửi sang client")
+        self._send_files(paths)
+
+    def _send_files(self, paths: list) -> None:
+        server = getattr(self.server_thread, "server", None)
+        if server is None or not self._files_allowed():
+            return
+        for path in paths:
+            log.info("Gửi file sang client: %s", path)
+            server.send_file(path)
+
+    def dragEnterEvent(self, event) -> None:
+        if self._files_allowed() and event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        paths = [url.toLocalFile() for url in event.mimeData().urls()
+                 if url.isLocalFile() and os.path.isfile(url.toLocalFile())]
+        if paths:
+            self._send_files(paths)
+            event.acceptProposedAction()
+
+    def _on_file_progress(self, outgoing: bool, name: str, done: int,
+                          total: int) -> None:
+        self._transfer_clear.stop()
+        self.transfer_bar.setVisible(True)
+        self.transfer_bar.setValue(int(done * 1000 / total) if total else 1000)
+        percent = int(done * 100 / total) if total else 100
+        verb = "Gửi" if outgoing else "Nhận"
+        self.transfer_label.setText(f"{verb} {name} · {percent}%")
+
+    def _on_file_done(self, outgoing: bool, name: str, ok: bool,
+                      detail: str) -> None:
+        self.transfer_bar.setVisible(False)
+        if ok:
+            text = f"Đã gửi {name}" if outgoing else f"Đã nhận {name}"
+            if not outgoing and self.tray_manager and self.tray_manager.icon:
+                self.tray_manager.icon.showMessage(
+                    "Đã nhận file", f"{name}\n{os.path.dirname(detail)}")
+        else:
+            text = f"{'Gửi' if outgoing else 'Nhận'} {name} lỗi: {detail}"
+        self.transfer_label.setText(text)
+        self.transfer_label.setToolTip(detail if ok and not outgoing else text)
+        self._transfer_clear.start(10000)
+
+    def _open_receive_dir(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(filetransfer.receive_dir())))
 
     def _append_log(self, msg: str) -> None:
         self.log_view.appendPlainText(msg)
@@ -502,6 +616,8 @@ class MainWindow(QMainWindow):
         self.server_thread.clipboard_from_client.connect(self._on_clipboard_from_client)
         self.server_thread.client_connected.connect(self._on_client_connected)
         self.server_thread.client_disconnected.connect(self._on_client_disconnected)
+        self.server_thread.file_progress.connect(self._on_file_progress)
+        self.server_thread.file_done.connect(self._on_file_done)
         self.server_thread.start()
         self._set_running_ui(True)
 

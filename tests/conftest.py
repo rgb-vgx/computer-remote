@@ -31,3 +31,13 @@ def isolated_settings(tmp_path_factory):
     QSettings.setDefaultFormat(QSettings.Format.IniFormat)
     QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(path))
     return path
+
+
+@pytest.fixture(autouse=True)
+def no_host_cursor(monkeypatch):
+    """Test không đọc con trỏ thật của máy chạy test (X11/Windows)."""
+    try:
+        import host
+    except Exception:
+        return
+    monkeypatch.setattr(host, "make_cursor_source", lambda: None)

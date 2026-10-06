@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import logging
 import os
 import queue
@@ -23,14 +24,18 @@ from logging.handlers import RotatingFileHandler
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QIntValidator, QPainter, QPixmap
+from PySide6.QtCore import QEvent, QObject, QPointF, QSettings, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QAction, QColor, QCursor, QDesktopServices, QFont, QImage, QIntValidator,
+    QPainter, QPainterPath, QPen, QPixmap,
+)
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QPushButton, QToolButton, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QMenu, QProgressBar, QPushButton, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
-from common import app_log_dir, no_console_kwargs, protocol, ui
+from common import app_log_dir, filetransfer, no_console_kwargs, protocol, ui
 from common.updater import current_version
 from common.updater_qt import UpdateController
 
@@ -207,6 +212,12 @@ class NetworkWorker(QThread):
     disconnected = Signal(str)
     clipboard_from_host = Signal(str)
     monitors_ready = Signal(list, int)
+    permissions_ready = Signal(dict)  # quyền của phiên (control/clipboard/files)
+    cursor_shape = Signal(dict)      # {"shape": tên} hoặc {"png", "hx", "hy"}
+    cursor_pos = Signal(float, float)  # vị trí con trỏ host (chuẩn hoá 0..1)
+    pong = Signal(float)             # round-trip ms
+    file_progress = Signal(bool, str, int, int)  # outgoing, tên, đã, tổng
+    file_done = Signal(bool, str, bool, str)     # outgoing, tên, ok, chi tiết
 
     def __init__(self, host: str, port: int, token: str) -> None:
         super().__init__()
@@ -222,6 +233,12 @@ class NetworkWorker(QThread):
         # generation encoder của host: bỏ packet codec cũ đến trễ (defense-in-depth,
         # TCP đã thứ tự hóa — client chỉ bảo vệ khi reconnect/re-negotiate).
         self._codec_generation = 0
+        # Thống kê: tổng byte nhận (MainWindow đọc định kỳ để tính bitrate).
+        self.bytes_received = 0
+        # Truyền file
+        self._file_queue: queue.Queue[str] = queue.Queue()
+        self._outgoing = filetransfer.SendQueue()
+        self._incoming = filetransfer.IncomingFiles()
 
     def stop(self) -> None:
         self._running = False
@@ -238,6 +255,10 @@ class NetworkWorker(QThread):
     def send_control(self, event: dict) -> None:
         if self._running:
             self.control_queue.put(event)
+
+    def send_file(self, path: str) -> None:
+        if self._running:
+            self._file_queue.put(str(path))
 
     def run(self) -> None:
         sock: socket.socket | None = None
@@ -261,6 +282,7 @@ class NetworkWorker(QThread):
         except Exception as exc:
             self.disconnected.emit(f"Lỗi: {exc}")
         finally:
+            self._abort_transfers()
             if self._h264_dec:
                 self._h264_dec.close()
             if sock is not None:
@@ -273,8 +295,10 @@ class NetworkWorker(QThread):
         assert self._sock is not None
         while self._running:
             self._flush_control()
+            self._pump_files()
 
-            ready, _, _ = select.select([self._sock], [], [], 0.01)
+            wait = 0.0 if self._outgoing.busy else 0.01
+            ready, _, _ = select.select([self._sock], [], [], wait)
             if not ready:
                 continue
 
@@ -289,8 +313,11 @@ class NetworkWorker(QThread):
                     self.disconnected.emit(f"Mất kết nối: {exc}")
                 return
 
+            self.bytes_received += protocol.HEADER_SIZE + len(payload)
             if ptype == protocol.PKT_FRAME:
                 self._handle_jpeg(payload)
+            elif ptype == protocol.PKT_FILE_DATA:
+                self._on_file_data(payload)
             elif ptype == protocol.PKT_FRAME_H264:
                 self._handle_h264(payload)
             elif ptype == protocol.PKT_CONTROL:
@@ -312,6 +339,9 @@ class NetworkWorker(QThread):
                     self.monitors_ready.emit(
                         list(info.get("monitors", [])),
                         int(info.get("current", 1) or 1))
+                    continue
+                elif info.get("type") == "permissions":
+                    self.permissions_ready.emit(dict(info))
                     continue
                 if info.get("type") != "info":
                     continue
@@ -423,21 +453,151 @@ class NetworkWorker(QThread):
             event = protocol.decode_json(payload)
         except Exception:
             return
-        if event.get("event") == "clipboard":
+        kind = event.get("event")
+        if kind == "clipboard":
             text = event.get("text", "")
             if text:
                 self.clipboard_from_host.emit(text)
+        elif kind == "cursor_pos":
+            try:
+                self.cursor_pos.emit(float(event["x"]), float(event["y"]))
+            except (KeyError, TypeError, ValueError):
+                pass
+        elif kind == "cursor":
+            self.cursor_shape.emit(event)
+        elif kind == "pong":
+            try:
+                rtt = time.monotonic() * 1000.0 - float(event.get("t"))
+            except (TypeError, ValueError):
+                return
+            if 0 <= rtt < 60000:
+                self.pong.emit(rtt)
+        elif kind in ("file_begin", "file_end", "file_cancel", "file_result"):
+            self._on_file_event(event)
+
+    # ---- File transfer (chạy trong thread mạng) ------------------------
+
+    def _send_file_result(self, transfer_id, ok: bool, name: str,
+                          error: str = "") -> None:
+        event = {"event": "file_result", "id": transfer_id, "ok": ok,
+                 "name": name}
+        if error:
+            event["error"] = error
+        self.send_control(event)
+
+    def _on_file_event(self, event: dict) -> None:
+        kind = event.get("event")
+        transfer_id = event.get("id")
+        if kind == "file_result":
+            ok = bool(event.get("ok"))
+            self.file_done.emit(True, str(event.get("name", "")), ok,
+                                "" if ok else str(event.get("error", "")))
+        elif kind == "file_begin":
+            try:
+                name = self._incoming.begin(event)
+            except filetransfer.TransferError as exc:
+                self._send_file_result(transfer_id, False,
+                                       str(event.get("name", "")), str(exc))
+                return
+            self.file_progress.emit(False, name, 0, int(event.get("size", 0) or 0))
+        elif kind == "file_end":
+            name = self._incoming.name_of(int(transfer_id or 0))
+            try:
+                path = self._incoming.end(event)
+            except filetransfer.TransferError as exc:
+                self._send_file_result(transfer_id, False, name, str(exc))
+                self.file_done.emit(False, name, False, str(exc))
+                return
+            log.info("Đã nhận file từ host: %s", path)
+            self._send_file_result(transfer_id, True, path.name)
+            self.file_done.emit(False, path.name, True, str(path))
+        elif kind == "file_cancel":
+            name = self._incoming.name_of(int(transfer_id or 0))
+            self._incoming.cancel(int(transfer_id or 0))
+            if name:
+                self.file_done.emit(False, name, False, "host đã huỷ")
+
+    def _on_file_data(self, payload: bytes) -> None:
+        try:
+            _id, name, done, total = self._incoming.data(payload)
+        except filetransfer.TransferError as exc:
+            log.warning("Nhận file lỗi: %s", exc)
+            return
+        self.file_progress.emit(False, name, done, total)
+
+    def _pump_files(self) -> None:
+        while True:
+            try:
+                self._outgoing.add(self._file_queue.get_nowait())
+            except queue.Empty:
+                break
+        if not self._outgoing.busy:
+            return
+        # Chỉ gửi khi socket còn chỗ: không kẹt sendall trong lúc host đang
+        # gửi frame cho mình (hai bên cùng đầy buffer).
+        _, writable, _ = select.select([], [self._sock], [], 0)
+        if not writable:
+            return
+        sock = self._sock
+        self._outgoing.pump(
+            lambda ev: protocol.send_json(sock, protocol.PKT_CONTROL, ev),
+            lambda data: protocol.send_packet(sock, protocol.PKT_FILE_DATA, data),
+            budget=2 * filetransfer.CHUNK_SIZE,
+            on_progress=lambda name, done, total: self.file_progress.emit(
+                True, name, done, total),
+            on_error=lambda name, err: self.file_done.emit(True, name, False, err))
+
+    def _abort_transfers(self) -> None:
+        self._incoming.abort_all()
+        current = self._outgoing.current
+        if current is not None:
+            self.file_done.emit(True, current.name, False, "mất kết nối")
+        self._outgoing.cancel_all()
 
 
 # ---------------------------------------------------------------------------
 # Remote view
 # ---------------------------------------------------------------------------
 
+# Tên hình con trỏ host gửi → Qt.CursorShape (con trỏ local đổi theo host).
+_CURSOR_SHAPES = {
+    "arrow": Qt.CursorShape.ArrowCursor, "ibeam": Qt.CursorShape.IBeamCursor,
+    "wait": Qt.CursorShape.WaitCursor, "busy": Qt.CursorShape.BusyCursor,
+    "cross": Qt.CursorShape.CrossCursor, "up_arrow": Qt.CursorShape.UpArrowCursor,
+    "hand": Qt.CursorShape.PointingHandCursor,
+    "size_h": Qt.CursorShape.SizeHorCursor, "size_v": Qt.CursorShape.SizeVerCursor,
+    "size_fd": Qt.CursorShape.SizeFDiagCursor,
+    "size_bd": Qt.CursorShape.SizeBDiagCursor,
+    "size_all": Qt.CursorShape.SizeAllCursor,
+    "forbidden": Qt.CursorShape.ForbiddenCursor,
+    "help": Qt.CursorShape.WhatsThisCursor,
+    "hidden": Qt.CursorShape.BlankCursor,
+}
+
+
+def cursor_from_event(event: dict) -> QCursor | None:
+    """Event ``cursor`` của host → QCursor (theo tên chuẩn hoặc ảnh PNG)."""
+    if "shape" in event:
+        shape = _CURSOR_SHAPES.get(str(event.get("shape")))
+        return QCursor(shape) if shape is not None else None
+    try:
+        data = base64.b64decode(event.get("png", ""), validate=True)
+    except (ValueError, TypeError):
+        return None
+    pixmap = QPixmap()
+    if not data or not pixmap.loadFromData(data, "PNG"):
+        return None
+    return QCursor(pixmap, int(event.get("hx", 0)), int(event.get("hy", 0)))
+
+
 class RemoteView(QLabel):
     mouse_event = Signal(dict)
     key_event = Signal(dict)
     # Báo MainWindow: vùng hiển thị đổi kích thước (dùng cho độ phân giải Tự động)
     view_resized = Signal()
+    files_dropped = Signal(list)
+    fullscreen_requested = Signal()
+    focus_changed = Signal(bool)
 
     def __init__(self) -> None:
         super().__init__()
@@ -458,6 +618,13 @@ class RemoteView(QLabel):
         self._pixmap: QPixmap | None = None
         self._draw_rect = (0.0, 0.0, 0.0, 0.0)
         self._scroll_acc = [0, 0]
+        # Con trỏ host: vị trí (chuẩn hoá) + vị trí local vừa gửi. Khi người
+        # ở máy host tự di chuột (lệch xa vị trí mình gửi) thì vẽ overlay.
+        self._remote_pos: tuple[float, float] | None = None
+        self._sent_pos: tuple[float, float] | None = None
+        self._remote_hidden = False
+        self.accept_files = False
+        self.setAcceptDrops(True)
 
     def set_frame(self, qimg: QImage) -> None:
         self._frame = qimg
@@ -472,13 +639,59 @@ class RemoteView(QLabel):
         self._frame = None
         self._pixmap = None
         self._hint = hint
+        self._remote_pos = None
+        self._sent_pos = None
+        self._remote_hidden = False
+        self.unsetCursor()
         self.setPixmap(QPixmap())
         self.setText(text)
         self.update()
 
+    # ---- Con trỏ host ----------------------------------------------------
+
+    def set_remote_cursor(self, event: dict) -> None:
+        cursor = cursor_from_event(event)
+        if cursor is None:
+            return
+        self._remote_hidden = event.get("shape") == "hidden"
+        self.setCursor(cursor)
+
+    def set_remote_pos(self, x: float, y: float) -> None:
+        old = self._remote_pos
+        self._remote_pos = (x, y)
+        if old is not None or self._overlay_visible():
+            self.update()
+
+    def _overlay_visible(self) -> bool:
+        if self._remote_pos is None or self._frame is None or self._remote_hidden:
+            return False
+        if self._sent_pos is None or not self.underMouse():
+            return True
+        dx = self._remote_pos[0] - self._sent_pos[0]
+        dy = self._remote_pos[1] - self._sent_pos[1]
+        return dx * dx + dy * dy > 0.0004  # lệch > ~2% khung hình
+
+    def _paint_remote_cursor(self, painter: QPainter) -> None:
+        x0, y0, w, h = self._draw_rect
+        px = x0 + self._remote_pos[0] * w
+        py = y0 + self._remote_pos[1] * h
+        path = QPainterPath(QPointF(px, py))
+        for dx, dy in ((0, 16), (4.5, 12), (7.5, 18.5), (10, 17.3),
+                       (7, 11), (12, 11)):
+            path.lineTo(px + dx, py + dy)
+        path.closeSubpath()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#000000"), 1.2))
+        painter.setBrush(QColor("#FFFFFF"))
+        painter.drawPath(path)
+
     def paintEvent(self, event) -> None:
         if self._frame is not None:
             super().paintEvent(event)
+            if self._overlay_visible():
+                painter = QPainter(self)
+                self._paint_remote_cursor(painter)
+                painter.end()
             return
         # Empty state: icon + tiêu đề + gợi ý, căn giữa vùng xem.
         painter = QPainter(self)
@@ -561,13 +774,54 @@ class RemoteView(QLabel):
             return "left"
         if qt_button == Qt.RightButton:
             return "right"
+        if qt_button == Qt.MiddleButton:
+            return "middle"
         return None
+
+    def event(self, event) -> bool:
+        # Tab/Shift+Tab: Qt dùng để chuyển focus giữa widget trước cả
+        # keyPressEvent — chặn lại để phím Tab đi sang host.
+        if (event.type() == QEvent.Type.KeyPress
+                and event.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab)):
+            self.keyPressEvent(event)
+            return True
+        return super().event(event)
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self.focus_changed.emit(True)
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self.focus_changed.emit(False)
+
+    def dragEnterEvent(self, event) -> None:
+        if self.accept_files and event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        paths = [url.toLocalFile() for url in event.mimeData().urls()
+                 if url.isLocalFile() and os.path.isfile(url.toLocalFile())]
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
 
     def mouseMoveEvent(self, event) -> None:
         coord = self._normalized(event.position())
         if coord:
+            was_visible = self._overlay_visible()
+            self._sent_pos = coord
+            if was_visible:
+                self.update()  # mình lại cầm chuột → ẩn overlay con trỏ host
             self.mouse_event.emit(
                 {"event": "mouse_move", "x": coord[0], "y": coord[1]})
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        if self._remote_pos is not None:
+            self.update()
 
     def mousePressEvent(self, event) -> None:
         self.setFocus()
@@ -607,6 +861,14 @@ class RemoteView(QLabel):
         event.accept()
 
     def keyPressEvent(self, event) -> None:
+        mods = event.modifiers()
+        if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and mods & Qt.KeyboardModifier.ControlModifier
+                and mods & Qt.KeyboardModifier.AltModifier):
+            # Ctrl+Alt+Enter: phím tắt local bật/tắt toàn màn hình.
+            if not event.isAutoRepeat():
+                self.fullscreen_requested.emit()
+            return
         key_str = _qt_key_to_key_str(event.key(), event.text())
         if key_str:
             self.key_event.emit({"event": "key_down", "key": key_str})
@@ -632,6 +894,213 @@ class RemoteView(QLabel):
             event.accept()
             return
         super().inputMethodEvent(event)
+
+
+# ---------------------------------------------------------------------------
+# Phím hệ thống (Alt+Tab, Win, Alt+F4...) → host
+# ---------------------------------------------------------------------------
+
+# Tổ hợp gửi nhanh từ menu "Gửi phím" (key_down theo thứ tự, key_up ngược lại).
+KEY_COMBOS = (
+    ("Ctrl + Alt + Del", ("Key.ctrl", "Key.alt", "Key.delete")),
+    ("Ctrl + Shift + Esc  (Task Manager)", ("Key.ctrl", "Key.shift", "Key.esc")),
+    ("Alt + Tab", ("Key.alt", "Key.tab")),
+    ("Alt + F4", ("Key.alt", "Key.f4")),
+    ("Phím Windows / Meta", ("Key.cmd",)),
+    ("Win + L  (khoá máy)", ("Key.cmd", "l")),
+    ("Print Screen", ("Key.print_screen",)),
+)
+
+
+def combo_events(keys) -> list[dict]:
+    return ([{"event": "key_down", "key": k} for k in keys]
+            + [{"event": "key_up", "key": k} for k in reversed(keys)])
+
+
+_VK_LWIN, _VK_RWIN, _VK_APPS = 0x5B, 0x5C, 0x5D
+
+
+def win_system_key(vk: int, alt: bool, ctrl: bool) -> str | None:
+    """Phím Windows sẽ "ăn" mất trước khi tới app → tên phím để chuyển sang host.
+
+    None = để Windows/Qt xử lý bình thường.
+    """
+    if vk in (_VK_LWIN, _VK_RWIN):
+        return "Key.cmd"
+    if vk == _VK_APPS:
+        return "Key.menu"
+    if vk == 0x2C:  # VK_SNAPSHOT
+        return "Key.print_screen"
+    if alt and vk == 0x09:   # Alt+Tab
+        return "Key.tab"
+    if alt and vk == 0x73:   # Alt+F4 (không đóng cửa sổ client)
+        return "Key.f4"
+    if alt and vk == 0x20:   # Alt+Space (menu cửa sổ)
+        return " "
+    if (alt or ctrl) and vk == 0x1B:  # Alt+Esc, Ctrl+Esc (Start)
+        return "Key.esc"
+    return None
+
+
+class SystemKeyCapture(QObject):
+    """Chuyển phím hệ thống sang host khi vùng xem đang có focus.
+
+    - Windows: low-level keyboard hook (WH_KEYBOARD_LL) chặn Alt+Tab, phím
+      Win... chỉ khi cửa sổ client ở foreground và RemoteView có focus.
+    - Linux/X11: ``grabKeyboard()`` (XGrabKeyboard) khi RemoteView có focus,
+      nên phím tắt của KWin/GNOME đi vào app; nhả ra khi mất focus.
+    """
+
+    def __init__(self, view: "RemoteView", emit_key) -> None:
+        super().__init__(view)
+        self.view = view
+        self.emit_key = emit_key
+        self.enabled = True
+        self.active = False
+        self._grabbed = False
+        self._hook = None
+        self._hook_proc = None
+        self._swallowed: dict[int, str] = {}
+        view.focus_changed.connect(self._on_focus)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self._update()
+
+    def set_active(self, active: bool) -> None:
+        self.active = active
+        self._update()
+
+    @property
+    def wanted(self) -> bool:
+        return self.enabled and self.active
+
+    def _update(self) -> None:
+        if sys.platform == "win32":
+            if self.wanted:
+                self._install_hook()
+            else:
+                self._remove_hook()
+        else:
+            self._on_focus(self.view.hasFocus())
+
+    def _on_focus(self, focused: bool) -> None:
+        if sys.platform == "win32":
+            return
+        if focused and self.wanted and not self._grabbed:
+            self.view.grabKeyboard()
+            self._grabbed = True
+        elif self._grabbed and not (focused and self.wanted):
+            self.view.releaseKeyboard()
+            self._grabbed = False
+
+    # ---- Windows hook ----------------------------------------------------
+
+    def _install_hook(self) -> None:
+        if self._hook is not None:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            lresult = ctypes.c_ssize_t
+            hookproc = ctypes.WINFUNCTYPE(lresult, ctypes.c_int,
+                                          wintypes.WPARAM, wintypes.LPARAM)
+
+            class KBDLLHOOKSTRUCT(ctypes.Structure):
+                _fields_ = [("vkCode", wintypes.DWORD),
+                            ("scanCode", wintypes.DWORD),
+                            ("flags", wintypes.DWORD),
+                            ("time", wintypes.DWORD),
+                            ("dwExtraInfo", ctypes.c_size_t)]
+
+            user32.SetWindowsHookExW.argtypes = [
+                ctypes.c_int, hookproc, wintypes.HINSTANCE, wintypes.DWORD]
+            user32.SetWindowsHookExW.restype = wintypes.HHOOK
+            user32.CallNextHookEx.argtypes = [
+                wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+            user32.CallNextHookEx.restype = lresult
+            user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+            user32.GetAsyncKeyState.restype = ctypes.c_short
+            kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+            kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+            def proc(code, wparam, lparam):
+                try:
+                    if code == 0:
+                        kb = ctypes.cast(
+                            lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                        ctrl = bool(user32.GetAsyncKeyState(0x11) & 0x8000)
+                        if self._handle_win_key(kb.vkCode, wparam, kb.flags,
+                                                ctrl, user32):
+                            return 1
+                except Exception as exc:
+                    log.debug("Keyboard hook lỗi: %s", exc)
+                return user32.CallNextHookEx(None, code, wparam, lparam)
+
+            self._user32 = user32
+            self._hook_proc = hookproc(proc)  # giữ tham chiếu, tránh bị GC
+            self._hook = user32.SetWindowsHookExW(
+                13, self._hook_proc, kernel32.GetModuleHandleW(None), 0)
+            if not self._hook:
+                log.warning("Không cài được keyboard hook (lỗi %d)",
+                            ctypes.get_last_error())
+                self._hook = None
+            else:
+                log.info("Bật chuyển phím hệ thống sang host")
+        except Exception as exc:
+            log.warning("Không bật được chuyển phím hệ thống: %s", exc)
+            self._hook = None
+
+    def _remove_hook(self) -> None:
+        if self._hook is None:
+            return
+        try:
+            self._user32.UnhookWindowsHookEx(self._hook)
+        except Exception:
+            pass
+        self._hook = None
+        self._hook_proc = None
+        for key in self._swallowed.values():
+            self.emit_key({"event": "key_up", "key": key})
+        self._swallowed.clear()
+
+    def _handle_win_key(self, vk: int, msg: int, flags: int, ctrl: bool,
+                        user32) -> bool:
+        """True = đã chuyển sang host, chặn không cho Windows xử lý."""
+        if flags & 0x10:  # LLKHF_INJECTED (do chính SendInput tạo ra)
+            return False
+        is_down = msg in (0x100, 0x104)   # WM_KEYDOWN, WM_SYSKEYDOWN
+        if not is_down:
+            key = self._swallowed.pop(vk, None)
+            if key is None:
+                return False
+            self.emit_key({"event": "key_up", "key": key})
+            return True
+        if vk in self._swallowed:  # auto-repeat của phím đã chặn
+            self.emit_key({"event": "key_down", "key": self._swallowed[vk]})
+            return True
+        if not self.view.hasFocus():
+            return False
+        if user32.GetForegroundWindow() != int(self.view.window().winId()):
+            return False
+        key = win_system_key(vk, alt=bool(flags & 0x20), ctrl=ctrl)
+        if key is None:
+            return False
+        self._swallowed[vk] = key
+        self.emit_key({"event": "key_down", "key": key})
+        return True
+
+    def shutdown(self) -> None:
+        self.active = False
+        self._remove_hook()
+        if self._grabbed:
+            self.view.releaseKeyboard()
+            self._grabbed = False
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +1179,7 @@ class MainWindow(QMainWindow):
         ):
             self.res_combo.addItem(label, width)
         self.res_combo.setCurrentIndex(0)
-        self.res_combo.setMinimumWidth(205)
+        self.res_combo.setMinimumWidth(195)
         # Combo editable cuộn tới cuối chữ → luôn hiện từ đầu nhãn preset.
         self.res_combo.currentIndexChanged.connect(
             lambda _i: self.res_combo.lineEdit().setCursorPosition(0))
@@ -761,15 +1230,42 @@ class MainWindow(QMainWindow):
         bar.addSpacing(4)
         bar.addWidget(ui.vline())
         bar.addSpacing(4)
-        field("Màn hình", self.monitor_combo)
-        field("Độ phân giải", self.res_combo)
+        # Hai combo này tự mô tả bằng giá trị → nhãn icon (kèm tooltip) cho gọn.
+        for icon_name, tip, combo in (
+                ("monitor", "Màn hình host", self.monitor_combo),
+                ("settings", "Độ phân giải stream", self.res_combo)):
+            icon_lbl = QLabel()
+            icon_lbl.setPixmap(ui.icon_pixmap(icon_name, ui.COLORS["muted"], 16))
+            icon_lbl.setToolTip(tip)
+            icon_lbl.setBuddy(combo)
+            bar.addWidget(icon_lbl)
+            bar.addWidget(combo)
         bar.addStretch(1)
+
+        # Gửi file / gửi phím / toàn màn hình
+        self.file_btn = self._tool_button(
+            "upload", "Gửi file sang máy host (hoặc kéo-thả file vào vùng xem)")
+        self.file_btn.clicked.connect(self._pick_files)
+        self.keys_menu = self._build_keys_menu()
+        self.keys_btn = self._tool_button("keyboard", "Gửi phím / tổ hợp phím")
+        self.keys_btn.setMenu(self.keys_menu)
+        self.keys_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.fullscreen_btn = self._tool_button(
+            "maximize", "Toàn màn hình (Ctrl+Alt+Enter)")
+        self.fullscreen_btn.clicked.connect(self._toggle_fullscreen)
+        for btn in (self.file_btn, self.keys_btn, self.fullscreen_btn):
+            bar.addWidget(btn)
+        bar.addWidget(ui.vline())
         bar.addWidget(self.update_btn)
+        self.toolbar = toolbar
 
         self.view = RemoteView()
         self.view.mouse_event.connect(self._on_mouse_event)
         self.view.key_event.connect(self._on_key_event)
         self.view.view_resized.connect(self._on_view_resized)
+        self.view.files_dropped.connect(self._send_files)
+        self.view.fullscreen_requested.connect(self._toggle_fullscreen)
+        self.syskeys = SystemKeyCapture(self.view, self._on_key_event)
         # Danh sách monitor host (nhận khi kết nối) — dùng cho chế độ Tự động.
         self._monitors: list[dict] = []
         self._monitor_current = 1
@@ -786,17 +1282,44 @@ class MainWindow(QMainWindow):
         self.size_label.setFont(ui.mono_font(12))
         self.size_label.setToolTip("Kích thước frame nhận được từ host")
 
+        # Truyền file: tiến trình + kết quả + mở thư mục nhận
+        self.transfer_label = ui.label("", "muted")
+        self.transfer_bar = QProgressBar()
+        self.transfer_bar.setTextVisible(False)
+        self.transfer_bar.setFixedWidth(140)
+        self.transfer_bar.setRange(0, 1000)
+        self.transfer_bar.setVisible(False)
+        self.open_folder_btn = self._tool_button(
+            "folder", "Mở thư mục chứa file nhận từ host")
+        self.open_folder_btn.clicked.connect(self._open_receive_dir)
+        self.open_folder_btn.setVisible(False)
+        self._transfer_clear = QTimer(self)
+        self._transfer_clear.setSingleShot(True)
+        self._transfer_clear.timeout.connect(lambda: self.transfer_label.setText(""))
+        # Độ trễ · FPS · bitrate
+        self.stats_label = ui.label("", "muted")
+        self.stats_label.setFont(ui.mono_font(12))
+        self.stats_label.setToolTip(
+            "Độ trễ khứ hồi (ping qua cùng kết nối) · khung hình/giây · băng thông nhận")
+
         statusbar = QFrame()
         statusbar.setObjectName("statusbar")
         bottom = QHBoxLayout(statusbar)
         bottom.setContentsMargins(12, 6, 14, 6)
         bottom.setSpacing(8)
         bottom.addWidget(self.status_pill)
+        bottom.addSpacing(8)
+        bottom.addWidget(self.transfer_bar)
+        bottom.addWidget(self.transfer_label)
+        bottom.addWidget(self.open_folder_btn)
         bottom.addStretch(1)
+        bottom.addWidget(self.stats_label)
+        bottom.addSpacing(8)
         bottom.addWidget(self.size_icon)
         bottom.addWidget(self.size_label)
         bottom.addSpacing(8)
         bottom.addWidget(ui.label(f"v{current_version()}", "muted"))
+        self.statusbar = statusbar
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -806,8 +1329,24 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.view, stretch=1)
         layout.addWidget(statusbar)
         self.setCentralWidget(central)
-        self.resize(1200, 760)
+        self.resize(1280, 780)
+        self._build_float_bar(central)
         self._set_connected_ui(False)
+        self._was_maximized = False
+        self.file_btn.setEnabled(False)
+        self.float_file_btn.setEnabled(False)
+
+        # Ping/thống kê
+        self._perms: dict = {}
+        self._rtt: float | None = None
+        self._frames = 0
+        self._last_bytes = 0
+        self._ping_timer = QTimer(self)
+        self._ping_timer.setInterval(2000)
+        self._ping_timer.timeout.connect(self._send_ping)
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setInterval(1000)
+        self._stats_timer.timeout.connect(self._update_stats)
 
         self._clipboard_timer = QTimer(self)
         self._clipboard_timer.timeout.connect(self._check_clipboard)
@@ -864,6 +1403,9 @@ class MainWindow(QMainWindow):
         geometry = self.settings.value("geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
+        capture = self.settings.value("capture_system_keys", True, bool)
+        self.capture_action.setChecked(capture)
+        self.syskeys.set_enabled(capture)
 
     def _save_settings(self) -> None:
         self.settings.setValue("host", self.host_edit.text().strip())
@@ -901,6 +1443,223 @@ class MainWindow(QMainWindow):
             self.connect_btn.setText(self.TEXT_CONNECT)
             self.connect_btn.setIcon(ui.icon("plug", "#FFFFFF"))
             ui.set_prop(self.connect_btn, "variant", "primary")
+
+    def _tool_button(self, icon_name: str, tip: str) -> QToolButton:
+        btn = QToolButton()
+        btn.setIcon(ui.icon(icon_name, ui.COLORS["muted"]))
+        btn.setProperty("variant", "ghost")
+        btn.setToolTip(tip)
+        btn.setAccessibleName(tip)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        return btn
+
+    def _build_keys_menu(self) -> QMenu:
+        menu = QMenu(self)
+        for label, keys in KEY_COMBOS:
+            action = menu.addAction(label)
+            action.triggered.connect(
+                lambda _checked=False, k=keys: self._send_combo(k))
+        menu.addSeparator()
+        self.capture_action = QAction(
+            "Chuyển phím hệ thống sang host (Alt+Tab, Win…)", menu)
+        self.capture_action.setCheckable(True)
+        self.capture_action.setChecked(True)
+        self.capture_action.setToolTip(
+            "Khi vùng xem đang có focus, các phím tắt của hệ điều hành\n"
+            "được gửi sang máy host thay vì máy này.")
+        self.capture_action.toggled.connect(self._on_capture_toggled)
+        menu.addAction(self.capture_action)
+        return menu
+
+    def _send_combo(self, keys) -> None:
+        if self.worker is None:
+            return
+        for event in combo_events(keys):
+            self.worker.send_control(event)
+        self.view.setFocus()
+
+    def _on_capture_toggled(self, checked: bool) -> None:
+        self.syskeys.set_enabled(checked)
+        self.settings.setValue("capture_system_keys", checked)
+
+    # ---- Toàn màn hình ---------------------------------------------------
+
+    def _build_float_bar(self, parent: QWidget) -> None:
+        """Thanh nổi ở mép trên khi toàn màn hình (hiện khi chuột chạm mép)."""
+        bar = QFrame(parent)
+        bar.setObjectName("floatbar")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(12, 6, 12, 8)
+        row.setSpacing(6)
+        self.float_stats = ui.label("", "muted")
+        self.float_stats.setFont(ui.mono_font(12))
+        row.addWidget(self.float_stats)
+        row.addSpacing(6)
+        float_file = self._tool_button("upload", "Gửi file")
+        float_file.clicked.connect(self._pick_files)
+        float_keys = self._tool_button("keyboard", "Gửi phím")
+        float_keys.setMenu(self.keys_menu)
+        float_keys.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        float_exit = self._tool_button("minimize", "Thoát toàn màn hình (Ctrl+Alt+Enter)")
+        float_exit.clicked.connect(self._toggle_fullscreen)
+        float_disc = self._tool_button("unplug", "Ngắt kết nối")
+        float_disc.setIcon(ui.icon("unplug", "#FCA5A5"))
+        float_disc.clicked.connect(lambda: self._disconnect("Đã ngắt bởi người dùng"))
+        self.float_file_btn = float_file
+        for btn in (float_file, float_keys, float_exit, float_disc):
+            row.addWidget(btn)
+        bar.hide()
+        self.float_bar = bar
+        self._float_timer = QTimer(self)
+        self._float_timer.setInterval(150)
+        self._float_timer.timeout.connect(self._update_float_bar)
+
+    def _toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.toolbar.show()
+            self.statusbar.show()
+            self._float_timer.stop()
+            self.float_bar.hide()
+            self.fullscreen_btn.setIcon(ui.icon("maximize", ui.COLORS["muted"]))
+            if self._was_maximized:
+                self.showMaximized()
+            else:
+                self.showNormal()
+        else:
+            self._was_maximized = self.isMaximized()
+            self.toolbar.hide()
+            self.statusbar.hide()
+            self.showFullScreen()
+            self.fullscreen_btn.setIcon(ui.icon("minimize", ui.COLORS["muted"]))
+            self._show_float_bar()
+            # Gợi ý cách thoát: giữ thanh nổi 2.5s rồi tự ẩn.
+            self._float_hold_until = time.monotonic() + 2.5
+            self._float_timer.start()
+        self.view.setFocus()
+
+    def _show_float_bar(self) -> None:
+        bar = self.float_bar
+        bar.adjustSize()
+        parent = bar.parentWidget()
+        bar.move((parent.width() - bar.width()) // 2, 0)
+        bar.show()
+        bar.raise_()
+
+    def _update_float_bar(self) -> None:
+        if not self.isFullScreen():
+            return
+        pos = self.mapFromGlobal(QCursor.pos())
+        bar = self.float_bar
+        if pos.y() <= 3 and 0 <= pos.x() < self.width():
+            if not bar.isVisible():
+                self._show_float_bar()
+        elif bar.isVisible():
+            menu_open = self.keys_menu.isVisible()
+            near = pos.y() <= bar.geometry().bottom() + 24
+            if (not near and not menu_open
+                    and time.monotonic() > getattr(self, "_float_hold_until", 0)):
+                bar.hide()
+
+    # ---- Truyền file -----------------------------------------------------
+
+    def _files_allowed(self) -> bool:
+        return self.worker is not None and bool(self._perms.get("files"))
+
+    def _pick_files(self) -> None:
+        if not self._files_allowed():
+            return
+        start = self.settings.value("last_file_dir", os.path.expanduser("~"), str)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Chọn file gửi sang máy host", start)
+        if paths:
+            self.settings.setValue("last_file_dir", os.path.dirname(paths[0]))
+            self._send_files(paths)
+
+    def _send_files(self, paths: list) -> None:
+        if not self._files_allowed():
+            return
+        for path in paths:
+            log.info("Gửi file sang host: %s", path)
+            self.worker.send_file(path)
+        self.transfer_label.setText(
+            f"Chuẩn bị gửi {len(paths)} file..." if len(paths) > 1 else "")
+
+    def _on_file_progress(self, outgoing: bool, name: str, done: int,
+                          total: int) -> None:
+        self._transfer_clear.stop()
+        self.transfer_bar.setVisible(True)
+        self.transfer_bar.setValue(int(done * 1000 / total) if total else 1000)
+        verb = "Đang gửi" if outgoing else "Đang nhận"
+        percent = int(done * 100 / total) if total else 100
+        self.transfer_label.setText(f"{verb} {name} · {percent}%")
+
+    def _on_file_done(self, outgoing: bool, name: str, ok: bool,
+                      detail: str) -> None:
+        self.transfer_bar.setVisible(False)
+        if ok and outgoing:
+            text = f"Đã gửi {name}"
+        elif ok:
+            text = f"Đã nhận {name}"
+            self.open_folder_btn.setVisible(True)
+            self.open_folder_btn.setToolTip(f"Mở thư mục: {os.path.dirname(detail)}")
+        else:
+            verb = "Gửi" if outgoing else "Nhận"
+            text = f"{verb} {name} thất bại: {detail}"
+        log.info("File: %s", text)
+        self.transfer_label.setText(text)
+        self._transfer_clear.start(8000)
+
+    def _open_receive_dir(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(filetransfer.receive_dir())))
+
+    # ---- Ping / thống kê -------------------------------------------------
+
+    def _send_ping(self) -> None:
+        if self.worker is not None:
+            self.worker.send_control(
+                {"event": "ping", "t": round(time.monotonic() * 1000.0, 1)})
+
+    def _on_pong(self, rtt: float) -> None:
+        self._rtt = rtt
+
+    def _update_stats(self) -> None:
+        if self.worker is None:
+            return
+        received = self.worker.bytes_received
+        mbps = (received - self._last_bytes) * 8 / 1e6
+        self._last_bytes = received
+        fps, self._frames = self._frames, 0
+        rtt = "—" if self._rtt is None else f"{self._rtt:.0f}"
+        text = f"{rtt} ms · {fps} fps · {mbps:.1f} Mbps"
+        self.stats_label.setText(text)
+        self.float_stats.setText(text)
+        color = ui.COLORS["muted"]
+        if self._rtt is not None and self._rtt >= 150:
+            color = ui.COLORS["danger"]
+        elif self._rtt is not None and self._rtt >= 60:
+            color = ui.COLORS["warning"]
+        self.stats_label.setStyleSheet(f"color: {color};")
+
+    def _on_permissions(self, info: dict) -> None:
+        self._perms = dict(info)
+        allowed = bool(info.get("files"))
+        for btn in (self.file_btn, self.float_file_btn):
+            btn.setEnabled(allowed)
+        self.view.accept_files = allowed
+        if not info.get("control", True):
+            self._set_status("online", "Đã kết nối — chỉ xem (host không cho điều khiển)")
+
+    def _reset_session_ui(self) -> None:
+        self._perms = {}
+        self._rtt = None
+        self._frames = 0
+        self._last_bytes = 0
+        for btn in (self.file_btn, self.float_file_btn):
+            btn.setEnabled(False)
+        self.view.accept_files = False
+        self.transfer_bar.setVisible(False)
+        self.stats_label.setText("")
+        self.float_stats.setText("")
 
     def _connect_from_form(self) -> None:
         if not self._want_connected and self.worker is None:
@@ -1048,6 +1807,7 @@ class MainWindow(QMainWindow):
         self.monitor_combo.blockSignals(False)
 
     def _on_frame_ready(self, img) -> None:
+        self._frames += 1
         size = f"{img.width()}x{img.height()}"
         if self.size_label.text() != size:
             self.size_label.setText(size)
@@ -1081,7 +1841,17 @@ class MainWindow(QMainWindow):
         self.worker.disconnected.connect(self._on_disconnected)
         self.worker.clipboard_from_host.connect(self._on_clipboard_from_host)
         self.worker.monitors_ready.connect(self._on_monitors_ready)
+        self.worker.permissions_ready.connect(self._on_permissions)
+        self.worker.cursor_shape.connect(self.view.set_remote_cursor)
+        self.worker.cursor_pos.connect(self.view.set_remote_pos)
+        self.worker.pong.connect(self._on_pong)
+        self.worker.file_progress.connect(self._on_file_progress)
+        self.worker.file_done.connect(self._on_file_done)
+        self._last_bytes = 0
         self.worker.start()
+        self._ping_timer.start()
+        self._stats_timer.start()
+        self.syskeys.set_active(True)
         mode = self._resolution_mode()
         if mode == "manual":
             width = self._selected_width()
@@ -1144,6 +1914,10 @@ class MainWindow(QMainWindow):
     def _teardown_worker(self) -> None:
         self._clipboard_timer.stop()
         self._auto_timer.stop()
+        self._ping_timer.stop()
+        self._stats_timer.stop()
+        self.syskeys.set_active(False)
+        self._reset_session_ui()
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(2000)
@@ -1158,6 +1932,8 @@ class MainWindow(QMainWindow):
         self._set_connected_ui(False)
         self._set_form_enabled(True)
         self._reset_monitor_combo()
+        if self.isFullScreen():
+            self._toggle_fullscreen()
         self.view.clear_frame("Đã ngắt kết nối", reason)
         self.size_label.setText("")
         self.size_icon.setVisible(False)
@@ -1180,6 +1956,7 @@ class MainWindow(QMainWindow):
             self.worker.send_control(event)
 
     def closeEvent(self, event) -> None:
+        self.syskeys.shutdown()
         self._want_connected = False
         self._reconnect_timer.stop()
         self._auto_timer.stop()

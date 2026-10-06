@@ -301,3 +301,197 @@ def test_mouse_mapping_uses_monitor_offset(monkeypatch):
                         lambda: (1920, 0, 1280, 720))
     server._apply_mouse({"event": "mouse_move", "x": 0.5, "y": 0.5})
     assert positions[-1] == (1920 + 640, 360)
+
+
+# ---------------------------------------------------------------------------
+# Xác nhận kết nối, quyền phiên, ping, truyền file
+# ---------------------------------------------------------------------------
+
+def idle_capture(sock, stop):
+    while not stop.is_set():
+        time.sleep(0.02)
+
+
+class Session:
+    """_handle_client thật (control loop thật, capture giả) trên socketpair."""
+
+    def __init__(self, server, addr=("10.1.1.1", 6000), token="secret1"):
+        self.server = server
+        server._capture_loop = idle_capture
+        self.a, self.b = socket.socketpair()
+        self.b.settimeout(5)
+        self.thread = threading.Thread(target=server._handle_client,
+                                       args=(self.a, addr), daemon=True)
+        self.thread.start()
+        protocol.send_json(self.b, protocol.PKT_HELLO, {"token": token})
+
+    def recv(self):
+        ptype, payload = protocol.recv_packet(self.b)
+        if ptype in (protocol.PKT_INFO, protocol.PKT_CONTROL):
+            return ptype, protocol.decode_json(payload)
+        return ptype, payload
+
+    def recv_until(self, pred):
+        while True:
+            ptype, obj = self.recv()
+            if pred(ptype, obj):
+                return obj
+
+    def send(self, event):
+        protocol.send_json(self.b, protocol.PKT_CONTROL, event)
+
+    def close(self):
+        self.server.disconnect_client()
+        self.thread.join(timeout=3)
+        self.a.close()
+        self.b.close()
+        assert not self.thread.is_alive()
+
+
+def test_view_only_session_blocks_input_but_allows_resolution(monkeypatch):
+    server = make_server(view_only=True)
+    applied = []
+    monkeypatch.setattr(server, "_apply_mouse", lambda e: applied.append(e))
+    s = Session(server)
+    perms = s.recv_until(lambda t, o: o.get("type") == "permissions")
+    assert perms["control"] is False and perms["files"] is True
+    s.send({"event": "mouse_move", "x": 0.5, "y": 0.5})
+    s.send({"event": "set_resolution", "max_width": 1280})
+    s.send({"event": "ping", "t": 123.5})
+    pong = s.recv_until(lambda t, o: o.get("event") == "pong")
+    assert pong["t"] == 123.5
+    assert applied == []
+    assert server._max_width == 1280
+    s.close()
+
+
+def test_file_upload_and_download_over_socket(tmp_path, monkeypatch):
+    from common import filetransfer as ft
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    server = make_server()
+    server._incoming = ft.IncomingFiles(directory_factory=lambda: inbox)
+    done = []
+    server.on_file_done = lambda *a: done.append(a)
+    s = Session(server)
+    s.recv_until(lambda t, o: o.get("type") == "permissions")
+
+    # client → host
+    payload = b"hello world" * 50000
+    s.send({"event": "file_begin", "id": 7, "name": "../evil.txt",
+            "size": len(payload)})
+    for i in range(0, len(payload), ft.CHUNK_SIZE):
+        protocol.send_packet(s.b, protocol.PKT_FILE_DATA,
+                             ft.pack_data(7, payload[i:i + ft.CHUNK_SIZE]))
+    s.send({"event": "file_end", "id": 7})
+    result = s.recv_until(lambda t, o: o.get("event") == "file_result")
+    assert result == {"event": "file_result", "id": 7, "ok": True,
+                      "name": "evil.txt"}
+    assert (inbox / "evil.txt").read_bytes() == payload
+    assert done[-1][:3] == (False, "evil.txt", True)
+
+    # host → client
+    src = tmp_path / "from_host.txt"
+    src.write_bytes(b"abc" * 1000)
+    server.send_file(str(src))
+    begin = s.recv_until(lambda t, o: isinstance(o, dict)
+                         and o.get("event") == "file_begin")
+    assert begin["name"] == "from_host.txt" and begin["size"] == 3000
+    chunks = b""
+    while True:
+        ptype, obj = s.recv()
+        if ptype == protocol.PKT_FILE_DATA:
+            chunks += ft.unpack_data(obj)[1]
+        elif isinstance(obj, dict) and obj.get("event") == "file_end":
+            break
+    assert chunks == b"abc" * 1000
+    s.send({"event": "file_result", "id": begin["id"], "ok": True,
+            "name": "from_host.txt"})
+    deadline = time.time() + 3
+    while time.time() < deadline and done[-1][0] is not True:
+        time.sleep(0.02)
+    assert done[-1] == (True, "from_host.txt", True, "")
+    s.close()
+
+
+def test_files_denied_by_session_permissions(tmp_path, monkeypatch):
+    from common import filetransfer as ft
+
+    server = make_server()
+    server._incoming = ft.IncomingFiles(directory_factory=lambda: tmp_path)
+    monkeypatch.setattr(server, "default_perms", lambda: {
+        "control": True, "clipboard": True, "files": False})
+    s = Session(server)
+    s.recv_until(lambda t, o: o.get("type") == "permissions")
+    s.send({"event": "file_begin", "id": 1, "name": "x.bin", "size": 1})
+    result = s.recv_until(lambda t, o: o.get("event") == "file_result")
+    assert result["ok"] is False and "không cho phép" in result["error"]
+    assert not list(tmp_path.iterdir())
+    s.close()
+
+
+def test_mouse_middle_button(monkeypatch):
+    server = make_server()
+    pressed = []
+
+    class FakeMouse:
+        position = (0, 0)
+
+        def press(self, btn):
+            pressed.append(btn)
+
+        def release(self, btn):
+            pass
+
+    fake_button = SimpleNamespace(left="L", right="R", middle="M")
+    monkeypatch.setitem(sys.modules, "pynput.mouse",
+                        types.SimpleNamespace(Button=fake_button))
+    monkeypatch.setattr(server, "_get_mouse", lambda: FakeMouse())
+    monkeypatch.setattr(server, "_monitor_rect", lambda: (0, 0, 100, 100))
+    for name in ("left", "right", "middle"):
+        server._apply_mouse({"event": "mouse_down", "button": name,
+                             "x": 0.5, "y": 0.5})
+    assert pressed == ["L", "R", "M"]
+
+
+def test_cursor_image_event_roundtrip():
+    import base64
+
+    import cv2
+    import numpy as np
+
+    # 2x1: pixel đỏ đặc + pixel trắng 50% alpha (premultiplied = 0x80808080)
+    event = host.cursor_image_event(2, 1, 1, 0, [0xFFFF0000, 0x80808080])
+    assert event["event"] == "cursor" and (event["hx"], event["hy"]) == (1, 0)
+    img = cv2.imdecode(np.frombuffer(base64.b64decode(event["png"]), np.uint8),
+                       cv2.IMREAD_UNCHANGED)
+    assert img.shape == (1, 2, 4)
+    assert tuple(img[0, 0]) == (0, 0, 255, 255)        # BGRA đỏ
+    assert tuple(img[0, 1]) == (255, 255, 255, 128)    # đã bỏ premultiply
+    assert host.cursor_image_event(0, 0, 0, 0, []) is None
+    assert host.cursor_image_event(2, 2, 0, 0, [1]) is None
+
+
+def test_poll_cursor_sends_shape_and_position(monkeypatch):
+    server = make_server()
+
+    class Source:
+        def __init__(self):
+            self.results = [(50, 25, {"event": "cursor", "shape": "ibeam"}),
+                            (50, 25, None), (75, 50, None)]
+
+        def poll(self):
+            return self.results.pop(0)
+
+    source = Source()
+    monkeypatch.setattr(host, "make_cursor_source", lambda: source)
+    monkeypatch.setattr(server, "_monitor_rect", lambda: (0, 0, 100, 100))
+    sent = []
+    monkeypatch.setattr(server, "_send_json",
+                        lambda sock, ptype, obj, timeout=None: sent.append(obj))
+    for _ in range(3):
+        server._poll_cursor(None)
+    assert sent == [{"event": "cursor", "shape": "ibeam"},
+                    {"event": "cursor_pos", "x": 0.5, "y": 0.25},
+                    {"event": "cursor_pos", "x": 0.75, "y": 0.5}]

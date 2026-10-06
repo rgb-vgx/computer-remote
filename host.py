@@ -10,7 +10,9 @@ Chạy:
 from __future__ import annotations
 
 import argparse
+import base64
 import hmac
+import json
 import logging
 import os
 import queue
@@ -27,13 +29,16 @@ import cv2
 import mss
 import numpy as np
 
-from common import app_log_dir, no_console_kwargs, protocol
+from common import app_log_dir, filetransfer, no_console_kwargs, protocol
 
 log = logging.getLogger("host")
 
 # Chống dò token: khóa IP tạm thời sau N lần sai.
 _AUTH_MAX_FAILURES = 5
 _AUTH_BLOCK_SECONDS = 30.0
+# Event điều khiển chuột/bàn phím — cần quyền "control".
+_INPUT_EVENTS = ("mouse_move", "mouse_down", "mouse_up", "scroll",
+                 "key_down", "key_up")
 
 # Debounce tạo lại encoder H.264: client auto-resize có thể gửi dồn dập,
 # gộp về tối đa 2 lần/giây (frame dừng tối đa ~500ms trong lúc chờ).
@@ -580,6 +585,114 @@ def check_display_env() -> None:
 # Host server
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Cursor tracking (client vẽ con trỏ local theo hình dạng con trỏ host)
+# ---------------------------------------------------------------------------
+
+def cursor_image_event(width: int, height: int, xhot: int, yhot: int,
+                       argb) -> dict | None:
+    """Ảnh con trỏ ARGB (premultiplied, như XFixes) → event PNG base64."""
+    if not (0 < width <= 256 and 0 < height <= 256):
+        return None
+    arr = np.asarray(argb, dtype="<u4")
+    if arr.size != width * height:
+        return None
+    bgra = arr.reshape(height, width).view(np.uint8).reshape(
+        height, width, 4).copy()
+    alpha = bgra[..., 3:4].astype(np.uint16)
+    rgb = bgra[..., :3].astype(np.uint16)
+    visible = alpha[..., 0] > 0
+    rgb[visible] = np.minimum(255, rgb[visible] * 255 // alpha[visible])
+    bgra[..., :3] = rgb.astype(np.uint8)
+    ok, buf = cv2.imencode(".png", bgra)
+    if not ok:
+        return None
+    return {"event": "cursor", "png": base64.b64encode(buf.tobytes()).decode(),
+            "hx": int(xhot), "hy": int(yhot)}
+
+
+class X11CursorSource:
+    """Vị trí + ảnh con trỏ qua XFixes (chỉ gửi ảnh khi cursor_serial đổi)."""
+
+    def __init__(self) -> None:
+        from Xlib import display
+        self._display = display.Display()
+        if not self._display.has_extension("XFIXES"):
+            raise RuntimeError("X server không có XFIXES")
+        self._display.xfixes_query_version()
+        self._root = self._display.screen().root
+        self._serial = None
+
+    def poll(self) -> tuple[int, int, dict | None] | None:
+        img = self._display.xfixes_get_cursor_image(self._root)
+        shape = None
+        if img.cursor_serial != self._serial:
+            self._serial = img.cursor_serial
+            shape = cursor_image_event(img.width, img.height, img.xhot,
+                                       img.yhot, img.cursor_image)
+        return img.x, img.y, shape
+
+
+class WindowsCursorSource:
+    """Vị trí + hình con trỏ chuẩn (so handle với LoadCursor IDC_*)."""
+
+    _IDC = {32512: "arrow", 32513: "ibeam", 32514: "wait", 32515: "cross",
+            32516: "up_arrow", 32642: "size_fd", 32643: "size_bd",
+            32644: "size_h", 32645: "size_v", 32646: "size_all",
+            32648: "forbidden", 32649: "hand", 32650: "busy", 32651: "help"}
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class CURSORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                        ("hCursor", wintypes.HANDLE),
+                        ("ptScreenPos", wintypes.POINT)]
+
+        self._ctypes = ctypes
+        self._info_cls = CURSORINFO
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.LoadCursorW.restype = wintypes.HANDLE
+        user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
+        user32.GetCursorInfo.restype = wintypes.BOOL
+        user32.GetCursorInfo.argtypes = [ctypes.POINTER(CURSORINFO)]
+        self._user32 = user32
+        self._names: dict[int, str] = {}
+        for idc, name in self._IDC.items():
+            handle = user32.LoadCursorW(None, ctypes.c_void_p(idc))
+            if handle:
+                self._names[handle] = name
+        self._last = None
+
+    def poll(self) -> tuple[int, int, dict | None] | None:
+        info = self._info_cls()
+        info.cbSize = self._ctypes.sizeof(info)
+        if not self._user32.GetCursorInfo(self._ctypes.byref(info)):
+            return None
+        if info.flags & 1:  # CURSOR_SHOWING
+            name = self._names.get(info.hCursor or 0, "arrow")
+        else:
+            name = "hidden"
+        shape = None
+        if name != self._last:
+            self._last = name
+            shape = {"event": "cursor", "shape": name}
+        return info.ptScreenPos.x, info.ptScreenPos.y, shape
+
+
+def make_cursor_source():
+    """Nguồn con trỏ theo nền tảng; None nếu không hỗ trợ (SSH, Wayland...)."""
+    try:
+        if sys.platform == "win32":
+            return WindowsCursorSource()
+        if sys.platform == "linux" and os.environ.get("DISPLAY"):
+            return X11CursorSource()
+    except Exception as exc:
+        log.info("Không theo dõi được con trỏ host: %s", exc)
+    return None
+
+
 def list_monitors() -> list[dict]:
     """Danh sách màn hình (mss index ≥ 1; bỏ index 0 = toàn bộ desktop)."""
     result: list[dict] = []
@@ -645,6 +758,44 @@ class HostServer:
         self._auth_failures: dict[str, int] = {}
         self._auth_blocked_until: dict[str, float] = {}
         self._auth_lock = threading.Lock()
+        # Quyền của phiên (gửi cho client trong packet "permissions").
+        self._perms = self.default_perms()
+        # Nhiều thread cùng gửi trên 1 socket (frame, clipboard, file, pong)
+        # → khoá để packet không xen byte vào nhau.
+        self._send_lock = threading.Lock()
+        # Truyền file
+        self._incoming = filetransfer.IncomingFiles()
+        self._outgoing = filetransfer.SendQueue()
+        self._file_queue: queue.Queue[str] = queue.Queue()
+        self.on_file_progress = None  # (outgoing, name, done, total)
+        self.on_file_done = None      # (outgoing, name, ok, detail)
+        # Con trỏ host (lazy, tạo trong capture thread).
+        self._cursor_source = None
+        self._cursor_source_ready = False
+        self._last_cursor_pos: tuple[int, int] | None = None
+
+    def default_perms(self) -> dict:
+        return {"control": not self.args.view_only, "clipboard": True,
+                "files": True}
+
+    @property
+    def permissions(self) -> dict:
+        return dict(self._perms)
+
+    def _send(self, sock: socket.socket, ptype: int, payload: bytes,
+              timeout: float | None = None) -> None:
+        if timeout is None:
+            self._send_lock.acquire()
+        elif not self._send_lock.acquire(timeout=timeout):
+            raise OSError("socket bận (đang gửi frame)")
+        try:
+            protocol.send_packet(sock, ptype, payload)
+        finally:
+            self._send_lock.release()
+
+    def _send_json(self, sock: socket.socket, ptype: int, obj: dict,
+                   timeout: float | None = None) -> None:
+        self._send(sock, ptype, json.dumps(obj).encode("utf-8"), timeout)
 
     def _notify(self, callback, *args) -> None:
         if callback is None:
@@ -659,9 +810,11 @@ class HostServer:
         sock, stop = self._client_sock, self._client_stop
         if sock is not None:
             try:
-                protocol.send_json(sock, protocol.PKT_INFO,
-                                   {"type": "error",
-                                    "message": "host đã ngắt kết nối"})
+                # timeout: không treo GUI nếu capture thread đang kẹt sendall.
+                self._send_json(sock, protocol.PKT_INFO,
+                                {"type": "error",
+                                 "message": "host đã ngắt kết nối"},
+                                timeout=0.5)
             except OSError:
                 pass
         if stop is not None:
@@ -670,6 +823,10 @@ class HostServer:
 
     def send_clipboard(self, text: str) -> None:
         self._clipboard_send_queue.put_nowait(text)
+
+    def send_file(self, path: str) -> None:
+        """Gửi file cho client đang kết nối (GUI thread gọi; control thread gửi)."""
+        self._file_queue.put_nowait(str(path))
 
     def serve_forever(self) -> None:
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -687,7 +844,6 @@ class HostServer:
             except OSError:
                 break
             log.info("Client kết nối từ %s:%d", *addr)
-            self._notify(self.on_client_connected, addr)
             try:
                 self._handle_client(client_sock, addr)
             except Exception as exc:
@@ -730,7 +886,7 @@ class HostServer:
         if now < blocked_until:
             log.warning("AUTH BLOCKED từ %s (còn %.0fs)", addr, blocked_until - now)
             try:
-                protocol.send_json(sock, protocol.PKT_INFO,
+                self._send_json(sock, protocol.PKT_INFO,
                                    {"type": "error",
                                     "message": "too many attempts, thử lại sau"})
             except OSError:
@@ -748,7 +904,7 @@ class HostServer:
                                 addr, failures, _AUTH_BLOCK_SECONDS)
             log.warning("AUTH FAIL từ %s (lần %d)", addr, failures)
             try:
-                protocol.send_json(sock, protocol.PKT_INFO,
+                self._send_json(sock, protocol.PKT_INFO,
                                    {"type": "error", "message": "auth failed"})
             except OSError:
                 pass
@@ -760,10 +916,17 @@ class HostServer:
         if client_stop.is_set():
             log.info("Client %s bị ngắt trong lúc xác thực", addr)
             return
-        protocol.send_json(sock, protocol.PKT_INFO,
+        perms = self.default_perms()
+        self._perms = perms
+        self._view_only_logged = False
+        self._send_json(sock, protocol.PKT_INFO,
                            {"type": "info", "message": "auth ok"})
+        self._send_json(sock, protocol.PKT_INFO,
+                        {"type": "permissions", **perms,
+                         "features": ["files", "cursor", "ping"]})
+        self._notify(self.on_client_connected, addr)
         try:
-            protocol.send_json(sock, protocol.PKT_INFO,
+            self._send_json(sock, protocol.PKT_INFO,
                                {"type": "monitors",
                                 "monitors": list_monitors(),
                                 "current": self._monitor_index})
@@ -841,7 +1004,7 @@ class HostServer:
                                            self.args.h264_crf)
                     last_recreate = time.time()
                     self._codec_generation += 1
-                    protocol.send_json(
+                    self._send_json(
                         sock, protocol.PKT_INFO,
                         {"type": "codec", "codec": "h264",
                          "width": frame_w, "height": frame_h,
@@ -866,6 +1029,7 @@ class HostServer:
                         continue
 
                     t0 = now
+                    self._poll_cursor(sock)
                     shot = sct.grab(monitor)
                     # View BGRA trên buffer của mss — không copy.
                     frame = np.asarray(shot)
@@ -914,7 +1078,7 @@ class HostServer:
                                                    self.args.h264_crf)
                             last_recreate = time.time()
                             self._codec_generation += 1
-                            protocol.send_json(
+                            self._send_json(
                                 sock, protocol.PKT_INFO,
                                 {"type": "codec", "codec": "h264",
                                  "width": frame_w, "height": frame_h,
@@ -951,7 +1115,7 @@ class HostServer:
                                 interpolation=cv2.INTER_AREA)
                         data = h264_enc.encode(frame)
                         if data:
-                            protocol.send_packet(
+                            self._send(
                                 sock, protocol.PKT_FRAME_H264, data)
                         sent_w, sent_h = frame_w, frame_h
                     else:
@@ -972,7 +1136,7 @@ class HostServer:
                                 continue
                             last_jpeg = buf.tobytes()
                             sent_w, sent_h = img.shape[1], img.shape[0]
-                        protocol.send_packet(
+                        self._send(
                             sock, protocol.PKT_FRAME, last_jpeg)
 
                     last_send = time.time()
@@ -1028,34 +1192,35 @@ class HostServer:
 
     def _control_loop(self, sock: socket.socket,
                       client_stop: threading.Event) -> None:
-        sock.setblocking(True)
         clipboard_poll_interval = 0
         try:
+            sock.setblocking(True)
             while not client_stop.is_set() and not self.stop_event.is_set():
                 self._flush_clipboard_send(sock)
                 clipboard_poll_interval += 1
                 if clipboard_poll_interval >= 4:
                     clipboard_poll_interval = 0
                     self._poll_host_clipboard(sock)
+                self._pump_files(sock)
 
-                ready, _, _ = select.select([sock], [], [], 0.5)
+                # Đang gửi file → vòng nhanh để bơm chunk tiếp theo.
+                wait = 0.0 if self._outgoing.busy else 0.5
+                ready, _, _ = select.select([sock], [], [], wait)
                 if not ready:
                     continue
 
                 ptype, payload = protocol.recv_packet(sock)
-                if ptype != protocol.PKT_CONTROL:
+                if ptype == protocol.PKT_FILE_DATA:
+                    self._on_file_data(sock, payload)
                     continue
-                if self.args.view_only:
-                    if not self._view_only_logged:
-                        log.info("--view-only: bỏ qua control.")
-                        self._view_only_logged = True
+                if ptype != protocol.PKT_CONTROL:
                     continue
                 try:
                     event = protocol.decode_json(payload)
                 except Exception:
                     continue
                 try:
-                    self._apply_event(event)
+                    self._handle_control_event(sock, event)
                 except Exception as exc:
                     log.warning("Bỏ qua control event lỗi: %s", exc)
         except (ConnectionError, OSError, struct.error) as exc:
@@ -1064,6 +1229,162 @@ class HostServer:
             log.error("Control loop lỗi: %s", exc)
         finally:
             client_stop.set()
+            self._abort_transfers()
+
+    def _handle_control_event(self, sock: socket.socket, event: dict) -> None:
+        kind = event.get("event")
+        if kind == "ping":
+            self._send_json(sock, protocol.PKT_CONTROL,
+                            {"event": "pong", "t": event.get("t")})
+            return
+        if kind in ("file_begin", "file_end", "file_cancel", "file_result"):
+            self._on_file_event(sock, event)
+            return
+        if kind in _INPUT_EVENTS and not self._perms["control"]:
+            if not self._view_only_logged:
+                log.info("Phiên chỉ xem: bỏ qua điều khiển từ client.")
+                self._view_only_logged = True
+            return
+        if kind == "clipboard" and not self._perms["clipboard"]:
+            return
+        self._apply_event(event)
+
+    # ---- File transfer -------------------------------------------------
+
+    def _file_result(self, sock: socket.socket, transfer_id, ok: bool,
+                     name: str = "", error: str = "") -> None:
+        event = {"event": "file_result", "id": transfer_id, "ok": ok,
+                 "name": name}
+        if error:
+            event["error"] = error
+        self._send_json(sock, protocol.PKT_CONTROL, event)
+
+    def _on_file_event(self, sock: socket.socket, event: dict) -> None:
+        kind = event.get("event")
+        transfer_id = event.get("id")
+        if kind == "file_result":
+            # Client báo kết quả nhận file host gửi.
+            ok = bool(event.get("ok"))
+            detail = event.get("error", "") if not ok else ""
+            name = str(event.get("name", ""))
+            log.info("Gửi file %s: %s", name, "xong" if ok else detail)
+            self._notify(self.on_file_done, True, name, ok, detail)
+            return
+        if not self._perms["files"]:
+            if kind == "file_begin":
+                self._file_result(sock, transfer_id, False,
+                                  str(event.get("name", "")),
+                                  "host không cho phép truyền file")
+            return
+        if kind == "file_begin":
+            try:
+                name = self._incoming.begin(event)
+            except filetransfer.TransferError as exc:
+                self._file_result(sock, transfer_id, False,
+                                  str(event.get("name", "")), str(exc))
+                return
+            log.info("Nhận file từ client: %s (%s byte)", name,
+                     event.get("size"))
+            self._notify(self.on_file_progress, False, name, 0,
+                         int(event.get("size", 0) or 0))
+        elif kind == "file_end":
+            name = self._incoming.name_of(int(transfer_id or 0))
+            try:
+                path = self._incoming.end(event)
+            except filetransfer.TransferError as exc:
+                self._file_result(sock, transfer_id, False, name, str(exc))
+                self._notify(self.on_file_done, False, name, False, str(exc))
+                return
+            log.info("Đã nhận file: %s", path)
+            self._file_result(sock, transfer_id, True, path.name)
+            self._notify(self.on_file_done, False, path.name, True, str(path))
+        elif kind == "file_cancel":
+            name = self._incoming.name_of(int(transfer_id or 0))
+            self._incoming.cancel(int(transfer_id or 0))
+            if name:
+                self._notify(self.on_file_done, False, name, False,
+                             "client đã huỷ")
+
+    def _on_file_data(self, sock: socket.socket, payload: bytes) -> None:
+        if not self._perms["files"]:
+            return
+        try:
+            transfer_id, name, done, total = self._incoming.data(payload)
+        except filetransfer.TransferError as exc:
+            log.warning("Nhận file lỗi: %s", exc)
+            try:
+                transfer_id, _ = filetransfer.unpack_data(payload)
+            except filetransfer.TransferError:
+                return
+            self._file_result(sock, transfer_id, False, "", str(exc))
+            return
+        self._notify(self.on_file_progress, False, name, done, total)
+
+    def _pump_files(self, sock: socket.socket) -> None:
+        while True:
+            try:
+                path = self._file_queue.get_nowait()
+            except queue.Empty:
+                break
+            if self._perms["files"]:
+                self._outgoing.add(path)
+            else:
+                self._notify(self.on_file_done, True, os.path.basename(path),
+                             False, "phiên này không cho phép truyền file")
+        if not self._outgoing.busy:
+            return
+        self._outgoing.pump(
+            lambda ev: self._send_json(sock, protocol.PKT_CONTROL, ev),
+            lambda data: self._send(sock, protocol.PKT_FILE_DATA, data),
+            on_progress=lambda name, done, total: self._notify(
+                self.on_file_progress, True, name, done, total),
+            on_error=lambda name, err: self._notify(
+                self.on_file_done, True, name, False, err))
+
+    def _abort_transfers(self) -> None:
+        self._incoming.abort_all()
+        current = self._outgoing.current
+        if current is not None:
+            self._notify(self.on_file_done, True, current.name, False,
+                         "mất kết nối")
+        self._outgoing.cancel_all()
+        while True:
+            try:
+                self._file_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    # ---- Cursor ----------------------------------------------------------
+
+    def _poll_cursor(self, sock: socket.socket) -> None:
+        if not self._cursor_source_ready:
+            self._cursor_source_ready = True
+            self._cursor_source = make_cursor_source()
+            self._last_cursor_pos = None
+        source = self._cursor_source
+        if source is None:
+            return
+        try:
+            result = source.poll()
+        except Exception as exc:
+            log.info("Tắt theo dõi con trỏ: %s", exc)
+            self._cursor_source = None
+            return
+        if result is None:
+            return
+        x, y, shape = result
+        if shape is not None:
+            self._send_json(sock, protocol.PKT_CONTROL, shape)
+        if (x, y) == self._last_cursor_pos:
+            return
+        self._last_cursor_pos = (x, y)
+        left, top, width, height = self._monitor_rect()
+        if width <= 0 or height <= 0:
+            return
+        self._send_json(sock, protocol.PKT_CONTROL, {
+            "event": "cursor_pos",
+            "x": round((x - left) / width, 5),
+            "y": round((y - top) / height, 5)})
 
     def _flush_clipboard_send(self, sock: socket.socket) -> None:
         while True:
@@ -1071,14 +1392,18 @@ class HostServer:
                 text = self._clipboard_send_queue.get_nowait()
             except queue.Empty:
                 return
+            if not self._perms["clipboard"]:
+                continue
             try:
-                protocol.send_json(
+                self._send_json(
                     sock, protocol.PKT_CONTROL,
                     {"event": "clipboard", "text": text, "source": "host"})
             except OSError:
                 return
 
     def _poll_host_clipboard(self, sock: socket.socket) -> None:
+        if not self._perms["clipboard"]:
+            return
         if self._clipboard_skip > 0:
             self._clipboard_skip -= 1
             return
@@ -1086,7 +1411,7 @@ class HostServer:
         if text and text != self._last_clipboard:
             self._last_clipboard = text
             try:
-                protocol.send_json(
+                self._send_json(
                     sock, protocol.PKT_CONTROL,
                     {"event": "clipboard", "text": text, "source": "host"})
             except OSError:
@@ -1157,7 +1482,8 @@ class HostServer:
             x = left + _clamp01(event.get("x", 0.0)) * screen_w
             y = top + _clamp01(event.get("y", 0.0)) * screen_h
             mouse.position = (int(x), int(y))
-            btn = Button.right if event.get("button") == "right" else Button.left
+            btn = {"right": Button.right, "middle": Button.middle}.get(
+                event.get("button"), Button.left)
             if kind == "mouse_down":
                 mouse.press(btn)
             else:

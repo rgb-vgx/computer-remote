@@ -135,3 +135,27 @@ def test_autostart_windows_registry(monkeypatch):
 
     host_gui.apply_autostart(False, "tok")
     assert not host_gui.autostart_enabled()
+
+
+def test_session_card_shows_permissions(qapp):
+    win = make_window(qapp)
+
+    class FakeServer:
+        permissions = {"control": False, "clipboard": True, "files": True}
+
+        def disconnect_client(self):
+            pass
+
+    win.server_thread = SimpleNamespace(server=FakeServer(), stop=lambda: None,
+                                        wait=lambda ms: None)
+    win._on_client_connected("100.64.0.9:1")
+    assert win.perms_label.text() == "Quyền: clipboard, truyền file"
+    assert win.send_file_btn.isEnabled()
+    win._on_file_progress(False, "a.txt", 1, 4)
+    assert "25%" in win.transfer_label.text()
+    win._on_file_done(False, "a.txt", True, "/tmp/a.txt")
+    assert win.transfer_label.text() == "Đã nhận a.txt"
+    win._on_client_disconnected()
+    assert not win.send_file_btn.isEnabled()
+    win.server_thread = None
+    cleanup(qapp, win)

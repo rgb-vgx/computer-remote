@@ -14,6 +14,8 @@ Packet types:
     2 = control event (JSON)
     3 = hello / auth (JSON)
     4 = info / error (JSON)
+    5 = frame H.264 (binary)
+    6 = dữ liệu file (id uint32 BE + bytes; xem common/filetransfer.py)
 
 Toàn bộ lỗi socket (timeout, đứt kết nối) được để "bong" lên cho caller
 xử lý (đóng socket, log). Module này không nuốt lỗi im lặng.
@@ -35,6 +37,7 @@ PKT_CONTROL = 2  # control event (mouse/keyboard/clipboard JSON)
 PKT_HELLO = 3    # auth hello (JSON)
 PKT_INFO = 4     # info/error (JSON)
 PKT_FRAME_H264 = 5  # H.264 frame
+PKT_FILE_DATA = 6   # chunk dữ liệu file (truyền file hai chiều)
 
 # Guard: từ chối payload_len bất thường (lỗi đồng bộ hoặc dữ liệu độc) để
 # không cấp phát bộ nhớ khổng lồ. 64 MiB dư sức cho 1 frame JPEG.

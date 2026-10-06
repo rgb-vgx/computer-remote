@@ -98,8 +98,25 @@ Port:  7777
 Token: change-me
 ```
 
-Bấm **Connect**. Di chuột / click trái / click phải trong vùng hiển thị để điều
-khiển host. Bấm **Disconnect** (hoặc đóng cửa sổ) để dừng.
+Bấm **Kết nối** (hoặc Enter). Di chuột / click trái, phải, giữa / cuộn trong
+vùng hiển thị để điều khiển host. Bấm **Ngắt kết nối** (hoặc đóng cửa sổ) để dừng.
+
+Trên thanh công cụ:
+
+- **Gửi file** (icon mũi tên lên) hoặc **kéo-thả file** vào vùng xem → file
+  sang `~/Downloads/RemoteDesktop` trên host. File host gửi sang cũng vào
+  `~/Downloads/RemoteDesktop` của client (nút thư mục ở thanh trạng thái mở nó).
+- **Gửi phím**: Ctrl+Alt+Del, Ctrl+Shift+Esc, Alt+Tab, Alt+F4, Win, Win+L,
+  Print Screen. Tuỳ chọn **Chuyển phím hệ thống sang host** (mặc định bật):
+  khi vùng xem có focus, Alt+Tab / phím Win / Alt+F4... đi sang host thay vì
+  máy client (Windows: keyboard hook; Linux X11: grab bàn phím).
+- **Toàn màn hình** (hoặc **Ctrl+Alt+Enter**): ẩn thanh công cụ; đưa chuột lên
+  mép trên để hiện thanh nổi (gửi file, gửi phím, thoát, ngắt kết nối).
+
+Thanh trạng thái hiện **độ trễ khứ hồi · FPS · băng thông** (ping mỗi 2s trên
+cùng kết nối, nên phản ánh cả độ trễ hàng đợi frame). Con trỏ chuột local đổi
+hình theo con trỏ host (I-beam, bàn tay, mũi tên kéo giãn...); khi người ở máy
+host tự di chuột, vị trí con trỏ host hiện thành mũi tên trên khung hình.
 
 Combo **Độ phân giải** (mặc định **Tự động (vừa cửa sổ)**): stream tự khớp
 đúng kích thước cửa sổ xem này và hiển thị 1:1 pixel — nét tối đa, ít băng
@@ -121,6 +138,9 @@ chối (sai token hoặc chủ động ngắt) thì dừng và hiện lý do.
 
 Host GUI (`remote-host-gui`) hiện client đang kết nối, báo qua tray icon, và
 có nút **Ngắt client** để đá client ra.
+
+Thẻ **Phiên điều khiển** có nút **Gửi file** (hoặc kéo-thả file vào cửa sổ),
+tiến trình truyền file và nút mở thư mục nhận file.
 
 ## 6. Nếu bật UFW trên Kubuntu
 
@@ -175,6 +195,8 @@ echo $DISPLAY                 # không được rỗng (vd ':0')
    │ inject (XTEST/     │                    │            QThread]   │
    │  pynput)           │   hello (type 3)   │                       │
    └────────────────────┘   info  (type 4)   └──────────────────────┘
+                             H.264 (type 5)
+                             file data (type 6) ⇄
 ```
 
 - **Protocol** (`common/protocol.py`): mỗi packet = header 5 byte
@@ -186,8 +208,18 @@ echo $DISPLAY                 # không được rỗng (vd ':0')
   trước (màn hình tĩnh cho frame giống hệt nhau) → không tốn băng thông, vẫn
   bắt được thay đổi nhỏ như con trỏ soạn thảo; heartbeat khi tĩnh 1 frame/s
   với JPEG, 4 frame/s với H.264 (bù delay 1–2 frame của decoder).
-- **Threading**: host có 2 thread (capture/send, receive/control) cho mỗi client;
-  client để toàn bộ socket trong 1 QThread, GUI thread chỉ chạm UI qua Qt signal.
+- **Threading**: host có 2 thread (capture/send, receive/control) cho mỗi client,
+  mọi lần gửi đi qua 1 khoá (`_send_lock`) để packet không xen byte; client để
+  toàn bộ socket trong 1 QThread, GUI thread chỉ chạm UI qua Qt signal.
+- **Bắt tay**: `hello` → `auth ok` →
+  `permissions` (quyền phiên + tính năng host hỗ trợ) → `monitors`. Client chỉ
+  bật nút gửi file khi host báo quyền `files` → client mới với host cũ vẫn chạy.
+- **Truyền file** (`common/filetransfer.py`): `file_begin` → các chunk 256 KiB
+  (type 6, `id` + bytes) → `file_end` → bên nhận trả `file_result`. Bên nhận ghi
+  `.part` rồi đổi tên, chỉ giữ basename (không ghi ra ngoài thư mục nhận). Bên
+  gửi bơm vài chunk mỗi vòng lặp nên frame/input không bị chặn khi gửi file lớn.
+- **Con trỏ**: host gửi `cursor` (tên hình chuẩn trên Windows, ảnh PNG qua
+  XFixes trên X11) khi đổi và `cursor_pos` khi con trỏ di chuyển.
 
 ---
 
@@ -264,7 +296,13 @@ cần cài tay một lần, sau đó update trong app.
   host** (tiếng Việt có dấu, CJK...) — inject trực tiếp qua X11 keysym-remap /
   Windows SendInput Unicode. Text do IME/bộ gõ phía **client** commit được gửi
   nguyên ký tự; compose IME ngay trên host vẫn có thể lệch.
-- Clipboard chỉ text; không audio, không file transfer.
+- Clipboard chỉ text; không audio. Truyền file theo từng file (chưa có thư mục,
+  chưa resume khi rớt mạng).
+- **Ctrl+Alt+Del thật** trên host Windows cần service chạy quyền SYSTEM
+  (`SendSAS`) — app hiện chỉ inject phím như thường nên Windows bỏ qua tổ hợp
+  này; dùng Ctrl+Shift+Esc để mở Task Manager. Host Linux nhận bình thường.
+- Chuyển phím hệ thống trên client Linux chỉ chạy với **X11** (Wayland không
+  cho app grab bàn phím).
 - **Multi-monitor**: client chọn màn hình trong combo "Màn hình" (host báo danh
   sách khi kết nối); toạ độ chuột được map theo đúng monitor đang xem.
 - Token đơn giản (đã so constant-time + khóa IP sau 5 lần sai), không TLS
@@ -290,7 +328,7 @@ release workflow còn chạy smoke test cài đặt updater trên cả Linux/Win
 
 1. **Video codec**: encode/decode trong process (PyAV) hoặc hardware
    (VAAPI/NVENC) để giảm latency và CPU.
-2. **Clipboard ảnh/file**.
+2. **Clipboard ảnh/file**, truyền cả thư mục, resume file lớn.
 3. **Dirty-rectangle/XDamage** + adaptive fps/quality theo băng thông.
 4. **Auth tốt hơn**: challenge-response, key trao đổi (đã có rate-limit).
 5. **Transport**: QUIC / WebRTC (NAT traversal, độ trễ thấp).
