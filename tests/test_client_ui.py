@@ -51,6 +51,7 @@ class FakeWorker(QObject):
     cursor_shape = Signal(dict)
     cursor_pos = Signal(float, float)
     pong = Signal(float)
+    quality_info = Signal(dict)
     file_progress = Signal(bool, str, int, int)
     file_done = Signal(bool, str, bool, str)
 

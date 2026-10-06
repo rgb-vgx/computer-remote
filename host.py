@@ -23,6 +23,7 @@ import subprocess as sp
 import sys
 import threading
 import time
+from collections import deque
 from logging.handlers import RotatingFileHandler
 
 import cv2
@@ -80,6 +81,7 @@ class H264Encoder:
         # veryfast crf14 = 9.0 KiB/frame (rất mạnh cho text).
         self.width = width
         self.height = height
+        self.crf = int(max(0, min(51, crf)))
 
         self._proc = sp.Popen(
             ['ffmpeg',
@@ -454,7 +456,7 @@ def _clipboard_set_xclip(text: str) -> None:
         if p.returncode != 0:
             log.warning("xclip set clipboard failed")
     except FileNotFoundError:
-        log.debug("xclip not installed, clipboard set disabled")
+        _warn_no_clipboard()
     except Exception as exc:
         log.debug("xclip set error: %s", exc)
 
@@ -467,10 +469,253 @@ def _clipboard_get_xclip() -> str:
         if p.returncode == 0:
             return p.stdout.decode("utf-8", errors="replace")
     except FileNotFoundError:
-        log.debug("xclip not installed, clipboard get disabled")
+        _warn_no_clipboard()
     except Exception:
         pass
     return ""
+
+
+class X11Clipboard:
+    """CLIPBOARD của X11 qua python-xlib — không cần cài xclip/xsel.
+
+    Hai kết nối X riêng (python-xlib không thread-safe):
+    - kết nối "đọc": ``get_text()`` gửi ConvertSelection rồi chờ SelectionNotify.
+    - kết nối "sở hữu": thread nền giữ quyền sở hữu CLIPBOARD sau ``set_text()``
+      và trả dữ liệu cho app khác dán (SelectionRequest), kể cả giao thức INCR
+      cho text lớn hơn một request X.
+    """
+
+    _CHUNK = 128 * 1024
+
+    def __init__(self) -> None:
+        from Xlib import X, display
+
+        self._X = X
+        self._reader = display.Display()
+        self._owner = display.Display()
+        self._read_lock = threading.Lock()
+        self._set_lock = threading.Lock()
+        atom = self._reader.intern_atom
+        self._clipboard = atom("CLIPBOARD")
+        self._utf8 = atom("UTF8_STRING")
+        self._targets = atom("TARGETS")
+        self._incr = atom("INCR")
+        self._prop = atom("REMOTE_MVP_CLIP")
+        self._text_targets = [self._utf8, atom("TEXT"), atom("STRING"),
+                              atom("text/plain;charset=utf-8"),
+                              atom("text/plain")]
+        self._string = atom("STRING")
+        self._atom_type = atom("ATOM")
+        self._read_win = self._reader.screen().root.create_window(
+            0, 0, 1, 1, 0, X.CopyFromParent,
+            event_mask=X.PropertyChangeMask)
+        self._owner_win = self._owner.screen().root.create_window(
+            0, 0, 1, 1, 0, X.CopyFromParent,
+            event_mask=X.PropertyChangeMask)
+        self._reader.flush()
+        self._owner.flush()
+        self._text: str | None = None      # text mình đang sở hữu
+        self._pending: list[str] = []      # set_text chờ thread nền áp dụng
+        self._incr_jobs: dict[tuple[int, int], tuple[object, bytes, int]] = {}
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._owner_loop,
+                                        name="x11-clipboard", daemon=True)
+        self._thread.start()
+
+    # ---- Đọc ------------------------------------------------------------
+
+    def get_text(self, timeout: float = 1.0) -> str:
+        X = self._X
+        with self._read_lock:
+            owner = self._reader.get_selection_owner(self._clipboard)
+            owner_id = getattr(owner, "id", owner) or 0
+            if owner_id == X.NONE:
+                return ""
+            if owner_id == self._owner_win.id:
+                return self._text or ""
+            for target in (self._utf8, self._string):
+                data = self._convert(target, timeout)
+                if data is not None:
+                    encoding = "utf-8" if target == self._utf8 else "latin-1"
+                    return data.decode(encoding, errors="replace")
+            return ""
+
+    def _wait_event(self, display, match, timeout: float):
+        deadline = time.monotonic() + timeout
+        while True:
+            while display.pending_events():
+                ev = display.next_event()
+                if match(ev):
+                    return ev
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            select.select([display], [], [], remaining)
+
+    def _convert(self, target: int, timeout: float) -> bytes | None:
+        X = self._X
+        win = self._read_win
+        win.delete_property(self._prop)
+        win.convert_selection(self._clipboard, target, self._prop, X.CurrentTime)
+        self._reader.flush()
+        ev = self._wait_event(
+            self._reader,
+            lambda e: e.type == X.SelectionNotify and e.requestor.id == win.id,
+            timeout)
+        if ev is None or ev.property == X.NONE:
+            return None
+        reply = win.get_full_property(self._prop, X.AnyPropertyType)
+        if reply is None:
+            return None
+        if reply.property_type != self._incr:
+            win.delete_property(self._prop)
+            self._reader.flush()
+            return bytes(reply.value)
+        # INCR: xoá property để báo sẵn sàng, đọc từng phần tới khi rỗng.
+        chunks = []
+        win.delete_property(self._prop)
+        self._reader.flush()
+        while True:
+            ev = self._wait_event(
+                self._reader,
+                lambda e: (e.type == X.PropertyNotify and e.window.id == win.id
+                           and e.atom == self._prop
+                           and e.state == X.PropertyNewValue),
+                timeout)
+            if ev is None:
+                return None
+            part = win.get_full_property(self._prop, X.AnyPropertyType)
+            win.delete_property(self._prop)
+            self._reader.flush()
+            if part is None or not part.value:
+                return b"".join(chunks)
+            chunks.append(bytes(part.value))
+
+    # ---- Ghi (sở hữu selection) ---------------------------------------
+
+    def set_text(self, text: str) -> None:
+        with self._set_lock:
+            self._pending.append(text)
+
+    def close(self) -> None:
+        self._stop.set()
+
+    def _owner_loop(self) -> None:
+        X = self._X
+        display = self._owner
+        while not self._stop.is_set():
+            try:
+                with self._set_lock:
+                    pending, self._pending = self._pending, []
+                if pending:
+                    self._text = pending[-1]
+                    self._owner_win.set_selection_owner(self._clipboard,
+                                                        X.CurrentTime)
+                    display.flush()
+                while display.pending_events():
+                    self._handle_owner_event(display.next_event())
+                select.select([display], [], [], 0.05)
+            except Exception as exc:
+                log.warning("Clipboard X11 lỗi: %s", exc)
+                time.sleep(0.5)
+
+    def _handle_owner_event(self, ev) -> None:
+        X = self._X
+        if ev.type == X.SelectionClear:
+            self._text = None  # app khác đã copy → không còn là chủ
+        elif ev.type == X.SelectionRequest:
+            self._serve(ev)
+        elif ev.type == X.PropertyNotify and ev.state == X.PropertyDelete:
+            self._continue_incr(ev)
+
+    def _serve(self, ev) -> None:
+        from Xlib.protocol import event as xevent
+
+        X = self._X
+        requestor = ev.requestor
+        prop = ev.property if ev.property != X.NONE else ev.target
+        text = self._text
+        if text is None or ev.selection != self._clipboard:
+            prop = X.NONE
+        elif ev.target == self._targets:
+            requestor.change_property(prop, self._atom_type, 32,
+                                      [self._targets, *self._text_targets])
+        elif ev.target in self._text_targets:
+            if ev.target == self._string:
+                data = text.encode("latin-1", errors="replace")
+            else:
+                data = text.encode("utf-8")
+            if len(data) > self._CHUNK:
+                # INCR: báo kích thước, gửi từng phần mỗi khi bên nhận xoá property.
+                requestor.change_attributes(event_mask=X.PropertyChangeMask)
+                requestor.change_property(prop, self._incr, 32, [len(data)])
+                self._incr_jobs[(requestor.id, prop)] = (requestor, data, 0)
+            else:
+                requestor.change_property(prop, ev.target, 8, data)
+        else:
+            prop = X.NONE
+        notify = xevent.SelectionNotify(
+            time=ev.time, requestor=requestor, selection=ev.selection,
+            target=ev.target, property=prop)
+        requestor.send_event(notify)
+        self._owner.flush()
+
+    def _continue_incr(self, ev) -> None:
+        key = (ev.window.id, ev.atom)
+        job = self._incr_jobs.get(key)
+        if job is None:
+            return
+        requestor, data, offset = job
+        chunk = data[offset:offset + self._CHUNK]
+        requestor.change_property(ev.atom, self._utf8, 8, chunk)
+        if chunk:
+            self._incr_jobs[key] = (requestor, data, offset + len(chunk))
+        else:
+            del self._incr_jobs[key]  # gửi property rỗng = kết thúc
+        self._owner.flush()
+
+
+_x11_clipboard: X11Clipboard | None = None
+_x11_clipboard_failed = False
+_clipboard_warned = False
+
+
+def _linux_clipboard() -> X11Clipboard | None:
+    global _x11_clipboard, _x11_clipboard_failed
+    if _x11_clipboard is None and not _x11_clipboard_failed:
+        try:
+            _x11_clipboard = X11Clipboard()
+        except Exception as exc:
+            _x11_clipboard_failed = True
+            log.warning("Không mở được clipboard X11 (%s) — thử dùng xclip", exc)
+    return _x11_clipboard
+
+
+def _clipboard_get_linux() -> str:
+    cb = _linux_clipboard()
+    if cb is not None:
+        try:
+            return cb.get_text()
+        except Exception as exc:
+            log.debug("Đọc clipboard X11 lỗi: %s", exc)
+            return ""
+    return _clipboard_get_xclip()
+
+
+def _clipboard_set_linux(text: str) -> None:
+    cb = _linux_clipboard()
+    if cb is not None:
+        cb.set_text(text)
+        return
+    _clipboard_set_xclip(text)
+
+
+def _warn_no_clipboard() -> None:
+    global _clipboard_warned
+    if not _clipboard_warned:
+        _clipboard_warned = True
+        log.warning("Không có xclip — đồng bộ clipboard bị tắt "
+                    "(cài: sudo apt install xclip)")
 
 
 # Windows: dùng PowerShell (có sẵn trong Windows 10/11), ép UTF-8 để không
@@ -584,6 +829,190 @@ def check_display_env() -> None:
 # ---------------------------------------------------------------------------
 # Host server
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Kiểm soát luồng + tự chỉnh chất lượng theo đường truyền
+# ---------------------------------------------------------------------------
+
+class FrameFlow:
+    """Giới hạn số frame "đang bay" (đã gửi, client chưa ack).
+
+    TCP tự nới buffer gửi lên nhiều MB: nếu cứ sendall thì frame xếp hàng
+    trong kernel và độ trễ tăng tới hàng giây khi mạng chậm. Chờ ack trước
+    khi gửi tiếp → luôn gửi frame MỚI NHẤT, độ trễ bị chặn ~max_inflight frame.
+    Client cũ không gửi ack → ``enabled=False``, hành vi như trước.
+    """
+
+    STALL_RESET = 3.0  # quá lâu không có ack → bỏ chờ (phòng client lỗi)
+
+    def __init__(self, enabled: bool, max_inflight: int = 2) -> None:
+        self.enabled = enabled
+        self.max_inflight = max_inflight
+        self.sent = 0
+        self.acked = 0
+        self._lock = threading.Lock()
+        self._unacked: deque[tuple[int, float, int]] = deque()
+        self.rtt = deque(maxlen=30)
+
+    def can_send(self, now: float) -> bool:
+        if not self.enabled:
+            return True
+        with self._lock:
+            if self.sent - self.acked < self.max_inflight:
+                return True
+            if self._unacked and now - self._unacked[0][1] > self.STALL_RESET:
+                log.warning("Client không ack frame %.0fs — bỏ chờ",
+                            now - self._unacked[0][1])
+                self.acked = self.sent
+                self._unacked.clear()
+                return True
+            return False
+
+    def on_sent(self, nbytes: int, now: float) -> None:
+        with self._lock:
+            self.sent += 1
+            if self.enabled:
+                self._unacked.append((self.sent, now, nbytes))
+
+    def on_ack(self, count, now: float) -> None:
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            count = min(count, self.sent)
+            if count <= self.acked:
+                return
+            self.acked = count
+            while self._unacked and self._unacked[0][0] <= count:
+                _seq, sent_at, _nbytes = self._unacked.popleft()
+                self.rtt.append(now - sent_at)
+
+
+# Bậc chất lượng, từ tốt nhất → nhẹ nhất: (JPEG quality | H.264 CRF, scale).
+JPEG_LEVELS = [(90, 1.0), (80, 1.0), (70, 1.0), (60, 1.0), (55, 0.85),
+               (50, 0.75), (45, 0.66), (40, 0.5)]
+H264_LEVELS = [(18, 1.0), (21, 1.0), (24, 1.0), (27, 0.85), (30, 0.75),
+               (33, 0.66), (36, 0.5)]
+# Chế độ (client chọn) → (bậc thấp nhất, bậc cao nhất, số frame đang bay).
+QUALITY_MODES = {
+    "balanced": (0, None, 2),
+    "quality": (0, 3, 3),   # không giảm độ phân giải
+    "speed": (2, None, 1),
+}
+
+
+class QualityController:
+    """Hạ/nâng bậc chất lượng theo tỉ lệ thời gian phải chờ ack.
+
+    - Nghẽn: >30% thời gian chờ ack và FPS < 80% mục tiêu → hạ 1 bậc ngay,
+      rồi giữ nguyên một lúc (backoff 5s → 30s nếu cứ dao động).
+    - Thông: <10% thời gian chờ trong 3 cửa sổ 1s liên tiếp → nâng 1 bậc.
+    """
+
+    WINDOW = 1.0
+
+    def __init__(self, codec: str, base: int, mode: str = "balanced") -> None:
+        table = H264_LEVELS if codec == "h264" else JPEG_LEVELS
+        if codec == "h264":
+            # CRF thấp hơn = nét hơn; tham số --h264-crf là mức nét nhất.
+            self.levels = [(max(value, base), scale) for value, scale in table]
+        else:
+            self.levels = [(min(value, base), scale) for value, scale in table]
+        self.codec = codec
+        self.mode = "balanced"
+        self.lo, self.hi = 0, len(self.levels) - 1
+        self.level = 0
+        self.max_inflight = 2
+        self._window_start = time.monotonic()
+        self._blocked = 0.0
+        self._frames = 0
+        self._good = 0
+        self._hold_until = 0.0
+        self._backoff = 5.0
+        self._last_drop = 0.0
+        self.set_mode(mode)
+
+    @property
+    def value(self) -> int:
+        return self.levels[self.level][0]
+
+    @property
+    def scale(self) -> float:
+        return self.levels[self.level][1]
+
+    def set_mode(self, mode: str) -> bool:
+        if mode not in QUALITY_MODES:
+            return False
+        lo, hi, inflight = QUALITY_MODES[mode]
+        self.mode = mode
+        self.lo = min(lo, len(self.levels) - 1)
+        self.hi = len(self.levels) - 1 if hi is None else min(hi, len(self.levels) - 1)
+        self.max_inflight = inflight
+        old = self.level
+        self.level = max(self.lo, min(self.hi, self.level))
+        self._good = 0
+        return self.level != old
+
+    def note_blocked(self, seconds: float) -> None:
+        self._blocked += seconds
+
+    def note_frame(self) -> None:
+        self._frames += 1
+
+    def info(self) -> dict:
+        return {"type": "quality", "mode": self.mode, "level": self.level,
+                "levels": len(self.levels), "codec": self.codec,
+                "value": self.value, "scale": self.scale}
+
+    def tick(self, now: float, target_fps: float) -> bool:
+        """Gọi mỗi vòng capture; True nếu vừa đổi bậc."""
+        window = now - self._window_start
+        if window < self.WINDOW:
+            return False
+        blocked = self._blocked / window
+        fps = self._frames / window
+        self._window_start = now
+        self._blocked = 0.0
+        self._frames = 0
+        if now - self._last_drop > 60.0:
+            self._backoff = 5.0  # ổn định lâu → quên lịch sử dao động
+        if blocked > 0.3 and fps < 0.8 * target_fps:
+            self._good = 0
+            if self.level < self.hi:
+                self.level += 1
+                self._hold_until = now + self._backoff
+                self._backoff = min(30.0, self._backoff * 2)
+                self._last_drop = now
+                return True
+            return False
+        if blocked < 0.1 and self._frames_ok(fps):
+            self._good += 1
+            if self._good >= 3 and now >= self._hold_until and self.level > self.lo:
+                self.level -= 1
+                self._good = 0
+                return True
+            return False
+        self._good = 0
+        return False
+
+    @staticmethod
+    def _frames_ok(fps: float) -> bool:
+        return fps > 0  # có gửi frame (kể cả heartbeat) trong cửa sổ
+
+
+def frame_size(cap_w: int, cap_h: int, max_width: int, scale: float,
+               even: bool) -> tuple[int, int]:
+    """Kích thước frame gửi: ≤ max-width, nhân hệ số scale (giữ tỉ lệ)."""
+    width = min(cap_w, max_width)
+    width = max(160, int(width * scale)) if scale < 1.0 else width
+    width = min(width, cap_w)
+    height = max(1, int(cap_h * width / cap_w))
+    if even:  # yuv420p (libx264) yêu cầu kích thước chẵn
+        width -= width % 2
+        height -= height % 2
+    return width, height
+
 
 # ---------------------------------------------------------------------------
 # Cursor tracking (client vẽ con trỏ local theo hình dạng con trỏ host)
@@ -744,10 +1173,10 @@ class HostServer:
         self._clipboard_skip = 0
         self.clipboard_get = (
             _clipboard_get_windows if sys.platform == "win32"
-            else _clipboard_get_xclip)
+            else _clipboard_get_linux)
         self.clipboard_set = (
             _clipboard_set_windows if sys.platform == "win32"
-            else _clipboard_set_xclip)
+            else _clipboard_set_linux)
         self.on_clipboard_received = None
         # Callback cho GUI: nhận addr khi client kết nối/ngắt.
         self.on_client_connected = None
@@ -769,6 +1198,9 @@ class HostServer:
         self._file_queue: queue.Queue[str] = queue.Queue()
         self.on_file_progress = None  # (outgoing, name, done, total)
         self.on_file_done = None      # (outgoing, name, ok, detail)
+        # Kiểm soát luồng / chất lượng (tạo lại mỗi phiên trong _handle_client).
+        self._flow = FrameFlow(enabled=False)
+        self._quality_mode = "balanced"
         # Con trỏ host (lazy, tạo trong capture thread).
         self._cursor_source = None
         self._cursor_source_ready = False
@@ -936,6 +1368,9 @@ class HostServer:
         # Codec negotiation: client's supported codecs
         client_codecs = hello.get("codecs", ["jpeg"])
         self._client_supports_h264 = "h264" in client_codecs
+        features = hello.get("features") or []
+        self._flow = FrameFlow(enabled="frame_ack" in features)
+        self._quality_mode = "balanced"
 
         sock.settimeout(None)
 
@@ -960,7 +1395,6 @@ class HostServer:
     def _capture_loop(self, sock: socket.socket,
                       client_stop: threading.Event) -> None:
         frame_budget = 1.0 / max(1, self.args.fps)
-        encode_params = _jpeg_encode_params(self.args.quality)
         frames_since_log = 0
         last_log = time.time()
 
@@ -978,6 +1412,17 @@ class HostServer:
             log.info("Sử dụng codec H.264 (ffmpeg libx264)")
         else:
             log.info("Sử dụng codec JPEG")
+        flow = self._flow
+        adapt = QualityController(
+            "h264" if use_h264 else "jpeg",
+            self.args.h264_crf if use_h264 else self.args.quality,
+            self._quality_mode)
+        flow.max_inflight = adapt.max_inflight
+        active_mode = adapt.mode
+        encode_params = _jpeg_encode_params(adapt.value)
+        if flow.enabled:
+            log.info("Tự chỉnh chất lượng theo đường truyền: bật (chế độ %s)",
+                     adapt.mode)
 
         try:
             with mss.MSS() as sct:
@@ -990,18 +1435,15 @@ class HostServer:
                 first = np.asarray(shot)
                 cap_h, cap_w = first.shape[:2]
                 active_max_width = self._max_width
-                if cap_w > active_max_width:
-                    scale = active_max_width / cap_w
-                    frame_w, frame_h = active_max_width, int(cap_h * scale)
-                else:
-                    frame_w, frame_h = cap_w, cap_h
+                active_level = adapt.level
+                frame_w, frame_h = frame_size(cap_w, cap_h, active_max_width,
+                                              adapt.scale, use_h264)
+                if flow.enabled:
+                    self._send_json(sock, protocol.PKT_INFO, adapt.info())
 
                 if use_h264:
-                    # yuv420p (libx264) yêu cầu kích thước chẵn.
-                    frame_w -= frame_w % 2
-                    frame_h -= frame_h % 2
                     h264_enc = H264Encoder(frame_w, frame_h, self.args.fps,
-                                           self.args.h264_crf)
+                                           adapt.value)
                     last_recreate = time.time()
                     self._codec_generation += 1
                     self._send_json(
@@ -1028,6 +1470,31 @@ class HostServer:
                         time.sleep(min(0.01, skip_until - now))
                         continue
 
+                    # Chế độ hình ảnh client chọn + đánh giá đường truyền.
+                    mono = time.monotonic()
+                    if self._quality_mode != active_mode:
+                        active_mode = self._quality_mode
+                        adapt.set_mode(active_mode)
+                        flow.max_inflight = adapt.max_inflight
+                    if flow.enabled:
+                        adapt.tick(mono, self.args.fps)
+                    if not flow.can_send(mono):
+                        # Client chưa nhận xong frame trước → chờ, rồi chụp
+                        # frame MỚI NHẤT thay vì dồn frame cũ vào buffer.
+                        time.sleep(0.004)
+                        adapt.note_blocked(time.monotonic() - mono)
+                        continue
+                    if adapt.level != active_level:
+                        active_level = adapt.level
+                        encode_params = _jpeg_encode_params(adapt.value)
+                        last_jpeg = b""
+                        force_send = True
+                        log.info("Chất lượng tự động: bậc %d/%d (%s %d, %.0f%% kích thước)",
+                                 adapt.level + 1, len(adapt.levels),
+                                 "CRF" if use_h264 else "JPEG q", adapt.value,
+                                 adapt.scale * 100)
+                        self._send_json(sock, protocol.PKT_INFO, adapt.info())
+
                     t0 = now
                     self._poll_cursor(sock)
                     shot = sct.grab(monitor)
@@ -1036,8 +1503,16 @@ class HostServer:
 
                     # Client đổi monitor / độ phân giải giữa chừng?
                     monitor_changed = self._monitor_index != active_monitor
+                    want_w, want_h = frame_size(
+                        frame.shape[1], frame.shape[0], self._max_width,
+                        adapt.scale, use_h264)
+                    h264_crf_changed = (
+                        use_h264 and h264_enc is not None
+                        and getattr(h264_enc, "crf", adapt.value) != adapt.value)
                     if (monitor_changed
-                            or self._max_width != active_max_width):
+                            or self._max_width != active_max_width
+                            or (want_w, want_h) != (frame_w, frame_h)
+                            or h264_crf_changed):
                         # Debounce chỉ cho đổi max-width (auto-resize dồn dập
                         # của client); đổi monitor áp dụng NGAY — không để
                         # user nhìn thấy màn hình cũ thêm ~0.5s.
@@ -1062,20 +1537,15 @@ class HostServer:
                                      frame.shape[0])
                         active_max_width = self._max_width
                         cap_w, cap_h = frame.shape[1], frame.shape[0]
-                        if cap_w > active_max_width:
-                            scale = active_max_width / cap_w
-                            frame_w = active_max_width
-                            frame_h = int(cap_h * scale)
-                        else:
-                            frame_w, frame_h = cap_w, cap_h
+                        frame_w, frame_h = frame_size(
+                            cap_w, cap_h, active_max_width, adapt.scale,
+                            use_h264)
                         if use_h264:
-                            frame_w -= frame_w % 2
-                            frame_h -= frame_h % 2
                             if h264_enc:
                                 h264_enc.close()
                             h264_enc = H264Encoder(frame_w, frame_h,
                                                    self.args.fps,
-                                                   self.args.h264_crf)
+                                                   adapt.value)
                             last_recreate = time.time()
                             self._codec_generation += 1
                             self._send_json(
@@ -1117,17 +1587,17 @@ class HostServer:
                         if data:
                             self._send(
                                 sock, protocol.PKT_FRAME_H264, data)
+                            flow.on_sent(len(data), time.monotonic())
+                            adapt.note_frame()
                         sent_w, sent_h = frame_w, frame_h
                     else:
                         # Không thay đổi (heartbeat) thì gửi lại JPEG đã encode,
                         # khỏi cvtColor + imencode lại.
                         if changed or not last_jpeg:
                             img = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                            if img.shape[1] > active_max_width:
-                                scale = active_max_width / img.shape[1]
+                            if img.shape[1] != frame_w:
                                 img = cv2.resize(
-                                    img, (active_max_width,
-                                          int(img.shape[0] * scale)),
+                                    img, (frame_w, frame_h),
                                     interpolation=cv2.INTER_AREA)
                             ok, buf = cv2.imencode(".jpg", img, encode_params)
                             if not ok:
@@ -1138,6 +1608,8 @@ class HostServer:
                             sent_w, sent_h = img.shape[1], img.shape[0]
                         self._send(
                             sock, protocol.PKT_FRAME, last_jpeg)
+                        flow.on_sent(len(last_jpeg), time.monotonic())
+                        adapt.note_frame()
 
                     last_send = time.time()
                     force_send = False
@@ -1236,6 +1708,15 @@ class HostServer:
         if kind == "ping":
             self._send_json(sock, protocol.PKT_CONTROL,
                             {"event": "pong", "t": event.get("t")})
+            return
+        if kind == "frame_ack":
+            self._flow.on_ack(event.get("n"), time.monotonic())
+            return
+        if kind == "set_quality_mode":
+            mode = str(event.get("mode", ""))
+            if mode in QUALITY_MODES and mode != self._quality_mode:
+                self._quality_mode = mode
+                log.info("Client chọn chế độ hình ảnh: %s", mode)
             return
         if kind in ("file_begin", "file_end", "file_cancel", "file_result"):
             self._on_file_event(sock, event)

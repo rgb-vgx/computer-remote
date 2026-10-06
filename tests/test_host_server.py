@@ -125,11 +125,11 @@ def test_clipboard_backend_windows(monkeypatch):
 
 def test_clipboard_backend_linux(monkeypatch):
     if sys.platform == "win32":
-        pytest.skip("nhánh xclip chỉ có trên Linux")
+        pytest.skip("nhánh X11 chỉ có trên Linux")
     monkeypatch.setattr(host.sys, "platform", "linux")
     server = make_server()
-    assert server.clipboard_get is host._clipboard_get_xclip
-    assert server.clipboard_set is host._clipboard_set_xclip
+    assert server.clipboard_get is host._clipboard_get_linux
+    assert server.clipboard_set is host._clipboard_set_linux
 
 
 def test_pynput_keyboard_key_mapping(monkeypatch):

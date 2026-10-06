@@ -26,7 +26,7 @@ import cv2
 import numpy as np
 from PySide6.QtCore import QEvent, QObject, QPointF, QSettings, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
-    QAction, QColor, QCursor, QDesktopServices, QFont, QImage, QIntValidator,
+    QAction, QActionGroup, QColor, QCursor, QDesktopServices, QFont, QImage, QIntValidator,
     QPainter, QPainterPath, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -216,6 +216,7 @@ class NetworkWorker(QThread):
     cursor_shape = Signal(dict)      # {"shape": tên} hoặc {"png", "hx", "hy"}
     cursor_pos = Signal(float, float)  # vị trí con trỏ host (chuẩn hoá 0..1)
     pong = Signal(float)             # round-trip ms
+    quality_info = Signal(dict)      # bậc chất lượng host đang dùng (tự chỉnh)
     file_progress = Signal(bool, str, int, int)  # outgoing, tên, đã, tổng
     file_done = Signal(bool, str, bool, str)     # outgoing, tên, ok, chi tiết
 
@@ -235,6 +236,9 @@ class NetworkWorker(QThread):
         self._codec_generation = 0
         # Thống kê: tổng byte nhận (MainWindow đọc định kỳ để tính bitrate).
         self.bytes_received = 0
+        # Số frame đã nhận — ack cho host (host chỉ gửi tiếp khi mình theo kịp).
+        self._frames_received = 0
+        self._ack_pending = False
         # Truyền file
         self._file_queue: queue.Queue[str] = queue.Queue()
         self._outgoing = filetransfer.SendQueue()
@@ -271,6 +275,7 @@ class NetworkWorker(QThread):
             protocol.send_json(sock, protocol.PKT_HELLO, {
                 "token": self.token,
                 "codecs": ["jpeg", "h264"] if H264Decoder.available() else ["jpeg"],
+                "features": ["frame_ack"],
             })
             log.debug("Đã gửi HELLO tới %s:%d", self.host, self.port)
 
@@ -314,12 +319,16 @@ class NetworkWorker(QThread):
                 return
 
             self.bytes_received += protocol.HEADER_SIZE + len(payload)
-            if ptype == protocol.PKT_FRAME:
-                self._handle_jpeg(payload)
+            if ptype in (protocol.PKT_FRAME, protocol.PKT_FRAME_H264):
+                # Ack SAU khi decode: client CPU chậm cũng là "nghẽn".
+                if ptype == protocol.PKT_FRAME:
+                    self._handle_jpeg(payload)
+                else:
+                    self._handle_h264(payload)
+                self._frames_received += 1
+                self._ack_pending = True
             elif ptype == protocol.PKT_FILE_DATA:
                 self._on_file_data(payload)
-            elif ptype == protocol.PKT_FRAME_H264:
-                self._handle_h264(payload)
             elif ptype == protocol.PKT_CONTROL:
                 self._handle_control(payload)
             elif ptype == protocol.PKT_INFO:
@@ -342,6 +351,9 @@ class NetworkWorker(QThread):
                     continue
                 elif info.get("type") == "permissions":
                     self.permissions_ready.emit(dict(info))
+                    continue
+                elif info.get("type") == "quality":
+                    self.quality_info.emit(dict(info))
                     continue
                 if info.get("type") != "info":
                     continue
@@ -397,6 +409,15 @@ class NetworkWorker(QThread):
 
     def _flush_control(self) -> None:
         assert self._sock is not None
+        if self._ack_pending:
+            # Gộp: nhiều frame nhận liền nhau chỉ cần 1 ack (số mới nhất).
+            self._ack_pending = False
+            try:
+                protocol.send_json(self._sock, protocol.PKT_CONTROL,
+                                   {"event": "frame_ack",
+                                    "n": self._frames_received})
+            except OSError:
+                return
         while True:
             try:
                 event = self.control_queue.get_nowait()
@@ -1253,7 +1274,13 @@ class MainWindow(QMainWindow):
         self.fullscreen_btn = self._tool_button(
             "maximize", "Toàn màn hình (Ctrl+Alt+Enter)")
         self.fullscreen_btn.clicked.connect(self._toggle_fullscreen)
-        for btn in (self.file_btn, self.keys_btn, self.fullscreen_btn):
+        self.mode_menu = self._build_mode_menu()
+        self.mode_btn = self._tool_button(
+            "activity", "Chế độ hình ảnh (tự chỉnh theo đường truyền)")
+        self.mode_btn.setMenu(self.mode_menu)
+        self.mode_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        for btn in (self.file_btn, self.keys_btn, self.mode_btn,
+                    self.fullscreen_btn):
             bar.addWidget(btn)
         bar.addWidget(ui.vline())
         bar.addWidget(self.update_btn)
@@ -1300,7 +1327,9 @@ class MainWindow(QMainWindow):
         self.stats_label = ui.label("", "muted")
         self.stats_label.setFont(ui.mono_font(12))
         self.stats_label.setToolTip(
-            "Độ trễ khứ hồi (ping qua cùng kết nối) · khung hình/giây · băng thông nhận")
+            "Độ trễ khứ hồi (ping qua cùng kết nối) · khung hình/giây · băng thông nhận\n"
+            "· chất lượng host đang dùng (Q = JPEG, CRF = H.264; % = kích thước khi\n"
+            "  đường truyền chậm, host tự giảm độ phân giải)")
 
         statusbar = QFrame()
         statusbar.setObjectName("statusbar")
@@ -1338,6 +1367,7 @@ class MainWindow(QMainWindow):
 
         # Ping/thống kê
         self._perms: dict = {}
+        self._quality: dict = {}
         self._rtt: float | None = None
         self._frames = 0
         self._last_bytes = 0
@@ -1403,6 +1433,10 @@ class MainWindow(QMainWindow):
         geometry = self.settings.value("geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
+        mode = self.settings.value("quality_mode", "balanced", str)
+        for action in self.mode_actions.actions():
+            if action.data() == mode:
+                action.setChecked(True)
         capture = self.settings.value("capture_system_keys", True, bool)
         self.capture_action.setChecked(capture)
         self.syskeys.set_enabled(capture)
@@ -1470,6 +1504,53 @@ class MainWindow(QMainWindow):
         self.capture_action.toggled.connect(self._on_capture_toggled)
         menu.addAction(self.capture_action)
         return menu
+
+    QUALITY_MODES = (
+        ("balanced", "Cân bằng (tự chỉnh theo đường truyền)"),
+        ("quality", "Ưu tiên chất lượng (giữ độ phân giải)"),
+        ("speed", "Ưu tiên tốc độ (độ trễ thấp nhất)"),
+    )
+
+    def _build_mode_menu(self) -> QMenu:
+        menu = QMenu(self)
+        self.mode_actions = QActionGroup(menu)
+        self.mode_actions.setExclusive(True)
+        for mode, label in self.QUALITY_MODES:
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setData(mode)
+            action.setChecked(mode == "balanced")
+            self.mode_actions.addAction(action)
+        self.mode_actions.triggered.connect(self._on_mode_changed)
+        return menu
+
+    def _quality_mode(self) -> str:
+        action = self.mode_actions.checkedAction()
+        return action.data() if action is not None else "balanced"
+
+    def _on_mode_changed(self, _action=None) -> None:
+        mode = self._quality_mode()
+        self.settings.setValue("quality_mode", mode)
+        if self.worker is not None:
+            self.worker.send_control({"event": "set_quality_mode", "mode": mode})
+
+    def _on_quality_info(self, info: dict) -> None:
+        self._quality = dict(info)
+        self._update_stats()
+
+    def _quality_text(self) -> str:
+        info = self._quality
+        if not info:
+            return ""
+        try:
+            label = "CRF" if info.get("codec") == "h264" else "Q"
+            text = f"{label}{int(info['value'])}"
+            scale = float(info.get("scale", 1.0))
+        except (KeyError, TypeError, ValueError):
+            return ""
+        if scale < 0.999:
+            text += f" {scale * 100:.0f}%"
+        return text
 
     def _send_combo(self, keys) -> None:
         if self.worker is None:
@@ -1631,6 +1712,9 @@ class MainWindow(QMainWindow):
         fps, self._frames = self._frames, 0
         rtt = "—" if self._rtt is None else f"{self._rtt:.0f}"
         text = f"{rtt} ms · {fps} fps · {mbps:.1f} Mbps"
+        quality = self._quality_text()
+        if quality:
+            text += f" · {quality}"
         self.stats_label.setText(text)
         self.float_stats.setText(text)
         color = ui.COLORS["muted"]
@@ -1651,6 +1735,7 @@ class MainWindow(QMainWindow):
 
     def _reset_session_ui(self) -> None:
         self._perms = {}
+        self._quality = {}
         self._rtt = None
         self._frames = 0
         self._last_bytes = 0
@@ -1845,6 +1930,7 @@ class MainWindow(QMainWindow):
         self.worker.cursor_shape.connect(self.view.set_remote_cursor)
         self.worker.cursor_pos.connect(self.view.set_remote_pos)
         self.worker.pong.connect(self._on_pong)
+        self.worker.quality_info.connect(self._on_quality_info)
         self.worker.file_progress.connect(self._on_file_progress)
         self.worker.file_done.connect(self._on_file_done)
         self._last_bytes = 0
@@ -1852,6 +1938,9 @@ class MainWindow(QMainWindow):
         self._ping_timer.start()
         self._stats_timer.start()
         self.syskeys.set_active(True)
+        if self._quality_mode() != "balanced":
+            self.worker.send_control(
+                {"event": "set_quality_mode", "mode": self._quality_mode()})
         mode = self._resolution_mode()
         if mode == "manual":
             width = self._selected_width()
