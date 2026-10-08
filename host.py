@@ -1154,6 +1154,9 @@ class HostServer:
         self._mouse = None
         self._keyboard = None
         self._view_only_logged = False
+        # Phím client đang giữ (key_down chưa có key_up) — nhả khi ngắt phiên
+        # để không kẹt phím trên host (vd Tab kẹt → tự chạy tab liên tục).
+        self._pressed_keys: set[str] = set()
         # Client có thể đổi max-width khi đang stream (set_resolution).
         self._max_width = self._clamp_width(args.max_width)
         # Multi-monitor: mss index (≥ 1); client có thể đổi (set_monitor).
@@ -1701,6 +1704,7 @@ class HostServer:
             log.error("Control loop lỗi: %s", exc)
         finally:
             client_stop.set()
+            self._release_pressed_keys()
             self._abort_transfers()
 
     def _handle_control_event(self, sock: socket.socket, event: dict) -> None:
@@ -1993,10 +1997,25 @@ class HostServer:
         try:
             if kind == "key_down":
                 kbd.press(key_str)
+                self._pressed_keys.add(key_str)
             else:
                 kbd.release(key_str)
+                self._pressed_keys.discard(key_str)
         except Exception as exc:
             log.warning("Keyboard inject error (%s): %s", key_str, exc)
+
+    def _release_pressed_keys(self) -> None:
+        """Nhả mọi phím client còn giữ khi phiên kết thúc (chống kẹt phím)."""
+        keys = sorted(self._pressed_keys)
+        self._pressed_keys.clear()
+        kbd = self._keyboard or None
+        if kbd is None:
+            return
+        for key in keys:
+            try:
+                kbd.release(key)
+            except Exception as exc:
+                log.debug("Không nhả được phím %r: %s", key, exc)
 
     def _apply_clipboard(self, event: dict) -> None:
         text = event.get("text", "")

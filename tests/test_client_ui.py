@@ -34,6 +34,15 @@ def test_qt_key_to_key_str():
     assert client._qt_key_to_key_str(Qt.Key_Left, "") == "Key.left"
     assert client._qt_key_to_key_str(Qt.Key_Backspace, "\x08") == "Key.backspace"
     assert client._qt_key_to_key_str(Qt.Key_Space, " ") == " "
+    assert client._qt_key_to_key_str(Qt.Key_Tab, "\t") == "Key.tab"
+    assert client._qt_key_to_key_str(Qt.Key_Backtab, "") == "Key.tab"
+    assert client._qt_key_to_key_str(Qt.Key_Insert, "") == "Key.insert"
+    assert client._qt_key_to_key_str(Qt.Key_Delete, "") == "Key.delete"
+    assert client._qt_key_to_key_str(Qt.Key_Meta, "") == "Key.cmd"
+    assert client._qt_key_to_key_str(Qt.Key_CapsLock, "") == "Key.caps_lock"
+    assert client._qt_key_to_key_str(Qt.Key_Menu, "") == "Key.menu"
+    assert client._qt_key_to_key_str(Qt.Key_Pause, "") == "Key.pause"
+    assert client._qt_key_to_key_str(Qt.Key_Print, "") == "Key.print_screen"
     # tổ hợp Ctrl: Qt không cho text printable -> dùng ký tự gốc
     assert client._qt_key_to_key_str(Qt.Key_C, "\x03") == "c"
     assert client._qt_key_to_key_str(Qt.Key_1, "\x01") == "1"
@@ -410,7 +419,7 @@ def connected_window(window):
 def test_win_system_key():
     assert client.win_system_key(0x5B, alt=False, ctrl=False) == "Key.cmd"
     assert client.win_system_key(0x09, alt=True, ctrl=False) == "Key.tab"
-    assert client.win_system_key(0x09, alt=False, ctrl=False) is None  # Tab thường
+    assert client.win_system_key(0x09, alt=False, ctrl=False) == "Key.tab"
     assert client.win_system_key(0x73, alt=True, ctrl=False) == "Key.f4"
     assert client.win_system_key(0x1B, alt=False, ctrl=True) == "Key.esc"
     assert client.win_system_key(0x1B, alt=False, ctrl=False) is None

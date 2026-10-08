@@ -220,6 +220,31 @@ def test_pynput_keyboard_unicode_send_fail(monkeypatch):
     assert calls == [("release", "ế")]
 
 
+def test_release_pressed_keys_on_session_end():
+    server = make_server()
+    calls = []
+
+    class FakeKbd:
+        def press(self, key):
+            calls.append(("press", key))
+
+        def release(self, key):
+            calls.append(("release", key))
+
+    server._keyboard = FakeKbd()
+    server._apply_keyboard({"event": "key_down", "key": "Key.ctrl"})
+    server._apply_keyboard({"event": "key_down", "key": "Key.tab"})
+    server._apply_keyboard({"event": "key_up", "key": "Key.ctrl"})
+    assert server._pressed_keys == {"Key.tab"}
+
+    server._release_pressed_keys()
+    assert calls[-1] == ("release", "Key.tab")
+    assert server._pressed_keys == set()
+    # Không có gì để nhả lần sau.
+    server._release_pressed_keys()
+    assert calls[-1] == ("release", "Key.tab")
+
+
 class FakeMSS:
     def __init__(self, monitors):
         self.monitors = monitors

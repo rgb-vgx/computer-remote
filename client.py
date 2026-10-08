@@ -150,12 +150,14 @@ class H264Decoder:
 
 _QT_KEY_TO_NAME = {
     0x01000020: "shift", 0x01000021: "ctrl", 0x01000023: "alt",
-    0x01000024: "cmd", 0x01001103: "alt_gr", 0x01000022: "caps_lock",
+    0x01000022: "cmd", 0x01001103: "alt_gr", 0x01000024: "caps_lock",
     0x01000004: "enter", 0x01000005: "enter", 0x01000001: "tab",
-    0x01000003: "backspace", 0x01000000: "esc", 0x01000006: "delete",
+    0x01000002: "tab",
+    0x01000003: "backspace", 0x01000000: "esc", 0x01000007: "delete",
     0x01000010: "home", 0x01000011: "end", 0x01000016: "page_up",
-    0x01000017: "page_down", 0x01000007: "insert", 0x01000008: "menu",
-    0x01000009: "pause", 0x0100000a: "print_screen",
+    0x01000017: "page_down", 0x01000006: "insert", 0x01000055: "menu",
+    0x01000008: "pause", 0x01000009: "print_screen",
+    0x0100000a: "print_screen",
     0x01000012: "left", 0x01000013: "up", 0x01000014: "right",
     0x01000015: "down",
     0x01000030: "f1",  0x01000031: "f2",  0x01000032: "f3",
@@ -893,13 +895,17 @@ class RemoteView(QLabel):
         key_str = _qt_key_to_key_str(event.key(), event.text())
         if key_str:
             self.key_event.emit({"event": "key_down", "key": key_str})
-        super().keyPressEvent(event)
+            event.accept()
+        else:
+            super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event) -> None:
         key_str = _qt_key_to_key_str(event.key(), event.text())
         if key_str:
             self.key_event.emit({"event": "key_up", "key": key_str})
-        super().keyReleaseEvent(event)
+            event.accept()
+        else:
+            super().keyReleaseEvent(event)
 
     def inputMethodEvent(self, event) -> None:
         """Text do IME/bộ gõ commit (Telex, Pinyin...) — gửi từng ký tự.
@@ -952,7 +958,7 @@ def win_system_key(vk: int, alt: bool, ctrl: bool) -> str | None:
         return "Key.menu"
     if vk == 0x2C:  # VK_SNAPSHOT
         return "Key.print_screen"
-    if alt and vk == 0x09:   # Alt+Tab
+    if vk == 0x09:           # Tab (thường, Shift+Tab, Ctrl+Tab, Alt+Tab)
         return "Key.tab"
     if alt and vk == 0x73:   # Alt+F4 (không đóng cửa sổ client)
         return "Key.f4"
